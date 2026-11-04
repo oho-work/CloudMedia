@@ -118,7 +118,7 @@ test('API, collector, worker, HLS probing and file persistence work together', {
   store.state.sources = [];
   store.state.settings.schedulerEnabled = false;
   await store.save();
-  worker = new Worker(store);
+  worker = new Worker(store, { now: () => new Date() });
   appServer = createApp(store, worker).listen(0, '127.0.0.1');
   await new Promise<void>(resolve => appServer!.once('listening', resolve));
   const apiOrigin = `http://127.0.0.1:${(appServer.address() as AddressInfo).port}`;
@@ -138,7 +138,10 @@ test('API, collector, worker, HLS probing and file persistence work together', {
     while (Date.now() < deadline) {
       const { body } = await request('/api/runs');
       const run = (body as Run[]).find(item => item.id === id);
-      if (run && !['queued', 'running'].includes(run.status)) return run;
+      if (run && !['queued', 'running'].includes(run.status)) {
+        const persisted = JSON.parse(await readFile(snapshotPath, 'utf8'));
+        if (persisted.runs.some((item: Run) => item.id === id && item.status === run.status && item.finishedAt === run.finishedAt)) return run;
+      }
       await delay(30);
     }
     throw new Error('fixture collection did not finish within 10 seconds');
@@ -333,7 +336,7 @@ test('API, collector, worker, HLS probing and file persistence work together', {
     assert.equal((await request(`/api/sources/${partialSource.id}`, 'DELETE')).status, 200);
   });
 
-  await t.test('cancellation during a slow playback request saves resources parsed since the last periodic checkpoint', async () => {
+  await t.test('each parsed resource is durable before cancellation during a later slow playback request', async () => {
     const created = await request('/api/sources', 'POST', sourceDefaults({ name: '中途取消源', baseUrl: upstreamOrigin, listPath: '/cancel-mid-list', requestIntervalMs: 1000, maxResourcePages: 0 }));
     assert.equal(created.status, 201);
     const midSource = created.body as Source;
@@ -344,7 +347,7 @@ test('API, collector, worker, HLS probing and file persistence work together', {
     assert.ok(upstreamCalls.some(call => call.path === '/vodplay/mid-4'));
     assert.ok(upstreamCalls.some(call => call.path === '/vodplay/mid-3'));
     const beforeCancel = JSON.parse(await readFile(snapshotPath, 'utf8'));
-    assert.equal(beforeCancel.resources.filter((item: Resource) => item.sourceId === midSource.id).length, 0, 'two parsed resources have not reached the five-page periodic checkpoint');
+    assert.equal(beforeCancel.resources.filter((item: Resource) => item.sourceId === midSource.id).length, 2, 'each completed playback page is saved immediately');
     assert.equal((await request(`/api/runs/${queued.body.id}/cancel`, 'POST')).status, 200);
     const finished = await awaitRun(queued.body.id);
     assert.equal(finished.status, 'interrupted'); assert.equal(finished.scanned, 1); assert.equal(finished.added, 1); assert.equal(finished.resourceCount, 2); assert.deepEqual(finished.errors, []);

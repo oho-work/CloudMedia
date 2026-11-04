@@ -10,9 +10,10 @@ import { collectionRequestSchema, sourceSchema, settingsSchema } from './validat
 import { nextScheduledAt } from './scheduler.js';
 import { playbackRouter } from './playback.js';
 import { localPosterPath } from '../shared/poster-path.js';
+import { appClock, type AppClock } from './clock.js';
 
 const asyncRoute = (handler: (req: Request, res: Response) => Promise<unknown>) => (req: Request, res: Response, next: NextFunction) => { void handler(req, res).catch(next); };
-export function createApp(store: Store, worker: Worker) {
+export function createApp(store: Store, worker: Worker, clock: AppClock = appClock) {
   const app = express();
   app.disable('x-powered-by');
   app.use(express.json({ limit: '128kb' }));
@@ -32,13 +33,15 @@ export function createApp(store: Store, worker: Worker) {
     if (left.length !== right.length || !timingSafeEqual(left, right)) { res.status(401).json({ error: '请输入访问令牌' }); return; }
     next();
   });
+  app.get('/api/time', (_req, res) => res.json(clock.status()));
   app.get('/api/dashboard', (_req, res) => {
     const state = store.state;
     const speeds = state.resources.filter(item => item.probe.status === 'ok' && item.probe.speedMbps != null).map(item => item.probe.speedMbps!);
+    const now = clock.now();
     const dashboard: Dashboard = { movieCount: state.movies.length, resourceCount: state.resources.length, sourceCount: state.sources.length,
       enabledSourceCount: state.sources.filter(source => source.enabled).length, healthyResources: state.resources.filter(item => item.probe.status === 'ok').length,
       averageSpeedMbps: speeds.length ? speeds.reduce((sum, value) => sum + value, 0) / speeds.length : null,
-      runningCount: state.runs.filter(run => ['running', 'queued'].includes(run.status)).length, storage: store.mode, schedulerNextAt: nextScheduledAt(state.settings) };
+      runningCount: state.runs.filter(run => ['running', 'queued'].includes(run.status)).length, storage: store.mode, schedulerNextAt: now ? nextScheduledAt(state.settings, now) : null };
     res.json(dashboard);
   });
   app.get('/api/movies', (req, res) => {
@@ -50,7 +53,7 @@ export function createApp(store: Store, worker: Worker) {
     }
     const limit = Math.min(100, requestedLimit);
     const needle = String(search).trim().toLowerCase();
-    const movies = store.state.movies.filter(movie => (!needle || `${movie.title} ${movie.originalTitle} ${movie.actors.join(' ')} ${movie.director}`.toLowerCase().includes(needle)) && (!type || movie.type === type) && (!year || movie.year === year) && (!sourceId || movie.sourceRefs.some(ref => ref.sourceId === sourceId))).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    const movies = store.state.movies.filter(movie => (!needle || `${movie.title} ${movie.originalTitle} ${movie.actors.join(' ')} ${movie.director}`.toLowerCase().includes(needle)) && (!type || movie.type === type) && (!year || movie.year === year) && (!sourceId || movie.sourceRefs.some(ref => ref.sourceId === sourceId))).sort((a, b) => b.createdAt.localeCompare(a.createdAt) || a.id.localeCompare(b.id));
     const counts = new Map<string, number>(); for (const resource of store.state.resources) counts.set(resource.movieId, (counts.get(resource.movieId) || 0) + 1);
     res.json({ items: movies.slice((page - 1) * limit, page * limit).map(movie => ({ ...movie, poster: localPosterPath(movie.poster), resourceCount: counts.get(movie.id) || 0 })), total: movies.length, page, limit,
       types: [...new Set(store.state.movies.map(movie => movie.type).filter(Boolean))].sort(), years: [...new Set(store.state.movies.map(movie => movie.year).filter(Boolean))].sort().reverse() });
@@ -64,7 +67,7 @@ export function createApp(store: Store, worker: Worker) {
   app.post('/api/archive/posters/retry', asyncRoute(async (_req, res) => {
     const summary = worker.posters.retry(); await store.save(); res.status(202).json(summary);
   }));
-  app.get('/api/sources', (_req, res) => res.json(store.state.sources));
+  app.get('/api/sources', (_req, res) => res.json([...store.state.sources].sort((a, b) => b.createdAt.localeCompare(a.createdAt) || a.id.localeCompare(b.id))));
   app.post('/api/sources', asyncRoute(async (req, res) => {
     const input = sourceSchema.parse(sourceDefaults(req.body));
     const source = sourceDefaults(input); store.state.sources.push(source); await store.save(); res.status(201).json(source);
@@ -97,7 +100,37 @@ export function createApp(store: Store, worker: Worker) {
     const request = collectionRequestSchema.parse(req.body ?? {});
     const run = worker.enqueue(source, request); await store.save(); res.status(202).json(run);
   }));
-  app.get('/api/runs', (_req, res) => res.json(store.state.runs));
+  app.get('/api/runs', (_req, res) => res.json([...store.state.runs].sort((a, b) => b.startedAt.localeCompare(a.startedAt) || a.id.localeCompare(b.id))));
+  app.delete('/api/runs/:id', asyncRoute(async (req, res) => {
+    const run = store.state.runs.find(item => item.id === req.params.id);
+    if (!run) { res.status(404).json({ error: '采集任务不存在' }); return; }
+    if (run.status === 'queued' || run.status === 'running') { res.status(409).json({ error: '请先取消或等待采集任务结束后再删除记录' }); return; }
+    const previousRuns = [...store.state.runs];
+    const source = store.state.sources.find(item => item.id === run.sourceId);
+    const previousScopes = source?.deletedRunScopes;
+    const previousSlots = source?.scheduledSlots;
+    worker.rememberDeletedRun(run);
+    const writtenScopes = source?.deletedRunScopes;
+    const writtenSlots = source?.scheduledSlots;
+    store.state.runs = store.state.runs.filter(item => item.id !== run.id);
+    try { await store.save(); }
+    catch (error) {
+      // Restore this deletion without discarding tasks created or removed while saving.
+      if (!store.state.runs.some(item => item.id === run.id)) {
+        const next = previousRuns.slice(previousRuns.indexOf(run) + 1).find(item => store.state.runs.includes(item));
+        const index = next ? store.state.runs.indexOf(next) : store.state.runs.length;
+        store.state.runs.splice(index, 0, run);
+      }
+      if (source && source.deletedRunScopes === writtenScopes) {
+        if (previousScopes === undefined) delete source.deletedRunScopes; else source.deletedRunScopes = previousScopes;
+      }
+      if (source && source.scheduledSlots === writtenSlots) {
+        if (previousSlots === undefined) delete source.scheduledSlots; else source.scheduledSlots = previousSlots;
+      }
+      throw error;
+    }
+    res.json({ ok: true });
+  }));
   app.post('/api/runs/:id/cancel', asyncRoute(async (req, res) => {
     const run = await worker.cancel(String(req.params.id));
     if (!run) { res.status(404).json({ error: '采集任务不存在' }); return; }
@@ -105,7 +138,8 @@ export function createApp(store: Store, worker: Worker) {
   }));
   app.get('/api/settings', (_req, res) => res.json(store.state.settings));
   app.put('/api/settings', asyncRoute(async (req, res) => {
-    const settings = settingsSchema.parse({ ...store.state.settings, ...req.body });
+    const legacyDailyTime = req.body && Object.hasOwn(req.body, 'dailyTime') && !Object.hasOwn(req.body, 'dailyTimes');
+    const settings = settingsSchema.parse({ ...store.state.settings, ...req.body, ...(legacyDailyTime ? { dailyTimes: [req.body.dailyTime] } : {}) });
     store.state.settings = settings; await store.save(); res.json(settings);
   }));
   app.post('/api/resources/:id/probe', asyncRoute(async (req, res) => {

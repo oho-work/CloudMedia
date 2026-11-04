@@ -39,11 +39,18 @@ export function upsertMovie(state: State, source: Source, input: CollectedMovie)
   else movie.sourceRefs.push({ sourceId: source.id, externalId: input.externalId, pageUrl: input.pageUrl, ...(input.sourceUpdatedOn ? { updatedOn: input.sourceUpdatedOn } : {}) });
   movie.updatedAt = now;
   const resources: Resource[] = [];
+  const entries = new Map<string, { entry: CollectedMovie['resources'][number]; url: URL; name: string; episode: string }>();
   for (const entry of input.resources) {
     let url: URL; try { url = new URL(entry.url, source.baseUrl); } catch { continue; }
     if (!['http:', 'https:'].includes(url.protocol)) continue;
     const name = entry.name.trim() || source.name.trim();
     const episode = entry.episode.trim() || '正片';
+    // A player can expose several alternative URLs for the same logical episode.
+    // Keep the existing last-value policy, but apply it once per checkpoint so
+    // unchanged cumulative snapshots cannot repeatedly reset a finished probe.
+    entries.set(JSON.stringify([name, episode]), { entry, url, name, episode });
+  }
+  for (const { entry, url, name, episode } of entries.values()) {
     const existing = state.resources.find(item => item.movieId === movie!.id && item.sourceId === source.id
       && (item.name.trim() || source.name.trim()) === name && (item.episode.trim() || '正片') === episode);
     if (existing) {

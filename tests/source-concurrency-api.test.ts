@@ -16,7 +16,7 @@ test('source concurrency survives API updates and restart while invalid values l
   const directory = await mkdtemp(path.join(tmpdir(), 'cloudmedia-concurrency-'));
   delete process.env.DATABASE_URL; delete process.env.APP_AUTH_TOKEN;
   process.env.DATA_FILE = path.join(directory, 'catalog.json');
-  const store = new Store(); const worker = new Worker(store);
+  const store = new Store(); const worker = new Worker(store, { now: () => new Date() });
   const server = createServer(createApp(store, worker));
   t.after(async () => {
     try {

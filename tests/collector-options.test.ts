@@ -141,7 +141,7 @@ test('refresh uses the saved detail page Referer after an initially successful c
   const result = upsertMovie(state, fixtureSource, movies[0]);
   const resource = result.resources[0];
   const snapshots: string[] = [];
-  const worker = new Worker({ state, async save() { snapshots.push(JSON.stringify(state)); } } as unknown as Store);
+  const worker = new Worker({ state, async save() { snapshots.push(JSON.stringify(state)); } } as unknown as Store, { now: () => new Date() });
   t.after(() => worker.stop());
   requests.length = 0;
   const refreshed = await worker.probe(resource, true);
@@ -157,7 +157,7 @@ test('refresh without a saved detail page falls back to the source entry', async
     { name: 'Line', episode: '正片', url: origin + '/stream/refresh.m3u8', pageUrl: origin + '/vodplay/root' },
   ] });
   result.movie.sourceRefs = [];
-  const worker = new Worker({ state, async save() {} } as unknown as Store);
+  const worker = new Worker({ state, async save() {} } as unknown as Store, { now: () => new Date() });
   t.after(() => worker.stop());
   requests.length = 0;
   const refreshed = await worker.probe(result.resources[0], true);

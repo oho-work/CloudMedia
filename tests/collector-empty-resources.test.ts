@@ -45,7 +45,7 @@ test('a missing playback selector records an actionable error while retaining me
   state.sources = [source];
   Object.assign(state.settings, { schedulerEnabled: false, probeEnabled: false, maxRetries: 0 });
   const store = { state, async save() {} } as unknown as Store;
-  worker = new Worker(store);
+  worker = new Worker(store, { now: () => new Date() });
   const run = worker.enqueue(source);
   const deadline = Date.now() + 3000;
   while (['queued', 'running'].includes(run.status) && Date.now() < deadline) await delay(5);

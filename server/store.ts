@@ -1,5 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import pg from 'pg';
 import type { State } from '../shared/types.js';
 import { initialState, settingsDefaults, sourceDefaults } from './defaults.js';
@@ -94,7 +95,17 @@ export class Store {
         await mkdir(path.dirname(this.file), { recursive: true });
         const temporary = `${this.file}.tmp`;
         await writeFile(temporary, snapshot, 'utf8');
-        await rename(temporary, this.file); return;
+        // Windows readers or antivirus can briefly hold the destination open.
+        // Keep the complete temporary snapshot and retry replacement in place.
+        for (let attempt = 0; ; attempt++) {
+          try { await rename(temporary, this.file); break; }
+          catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            if (!['EPERM', 'EACCES', 'EBUSY'].includes(code || '') || attempt >= 5) throw error;
+            await delay(10 * 2 ** attempt);
+          }
+        }
+        return;
       }
       const state: State = JSON.parse(snapshot);
       const client = await this.pool.connect();

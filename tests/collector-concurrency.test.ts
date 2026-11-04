@@ -71,14 +71,17 @@ test('cancelling a collector queued for the shared source budget never starts HT
   } finally { controller.abort(); release(); await occupied; await collection.catch(() => {}); await f.close(); }
 });
 
-test('detail requests fill the configured concurrency and finish each batch before yielding', { timeout: 5000 }, async () => {
+test('ordered standalone results bound completed buffers and drain work when the consumer returns', { timeout: 5000 }, async () => {
   const waiting: ServerResponse[] = [];
   let resolvePair!: () => void;
   const pair = new Promise<void>(resolve => { resolvePair = resolve; });
+  let resolveThird!: () => void;
+  const third = new Promise<void>(resolve => { resolveThird = resolve; });
   const f = await fixture((path, _request, response) => {
     if (path === '/list') { response.end(detailLinks(4)); return; }
     waiting.push(response);
     if (waiting.length === 2) resolvePair();
+    if (waiting.length === 3) resolveThird();
   });
   const controller = new AbortController();
   const iterator = collectSource(f.source(2), context({ signal: controller.signal }));
@@ -88,12 +91,15 @@ test('detail requests fill the configured concurrency and finish each batch befo
     assert.equal(f.maximum, 2);
     waiting[1].end('<h1>Second</h1>');
     await delay(15);
+    assert.equal(f.requests.length, 3, 'a completed out-of-order movie must still occupy the bounded result buffer');
     waiting[0].end('<h1>First</h1>');
     assert.equal((await first).value?.title, 'First');
-    assert.equal(f.active, 0, 'no collector HTTP work may remain while a movie is yielded');
-    assert.equal(f.requests.length, 3, 'later detail batches wait until the consumer resumes');
+    await Promise.race([third, delay(300).then(() => assert.fail('consuming one ordered result must admit one replacement'))]);
+    assert.equal(f.requests.length, 4, 'one active replacement and one buffered result fill the two slots');
     await iterator.return(undefined);
-    assert.equal(f.requests.length, 3);
+    await delay(15);
+    assert.equal(f.active, 0, 'return must abort and drain the active replacement request');
+    assert.equal(f.requests.length, 4);
   } finally { controller.abort(); await first.catch(() => {}); await iterator.return(undefined).catch(() => {}); await f.close(); }
 });
 
@@ -130,7 +136,7 @@ test('several series share one request limit and serialize monotonic resource ch
     assert.equal(movies.length, 3);
     assert.equal(f.maximum, 3, 'nested movie and episode work must not multiply the request limit');
     assert.equal(maximumWrites, 1, 'storage checkpoints must never race');
-    for (const counts of snapshots.values()) assert.deepEqual(counts, [0, 5, 8]);
+    for (const counts of snapshots.values()) assert.deepEqual(counts, Array.from({ length: 9 }, (_, index) => index));
     assert.equal(writes, 0);
   } finally { await f.close(); }
 });
@@ -201,7 +207,7 @@ for (const interruption of ['cancel', '403'] as const) {
       else { pending!.writeHead(403); pending!.end('Forbidden'); }
       await assert.rejects(collection, interruption === 'cancel' ? /cancel|abort|取消/i : /403/);
       assert.deepEqual(snapshots.at(-1)?.resources.map(resource => [resource.episode, resource.url]), [['第4集', 'https://cdn.example/success.m3u8']]);
-      assert.deepEqual(f.requests.filter(request => request.path.startsWith('/vodplay/')).map(request => request.path), ['/vodplay/1-4', '/vodplay/1-3']);
+      assert.deepEqual(f.requests.filter(request => request.path.startsWith('/vodplay/')).map(request => request.path), ['/vodplay/1-4', '/vodplay/1-3', '/vodplay/1-2']);
       await delay(20);
       assert.equal(f.active, 0);
     } finally { controller.abort(); await collection.catch(() => {}); await f.close(); }

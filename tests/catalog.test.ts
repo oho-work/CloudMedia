@@ -103,9 +103,9 @@ test('scheduler uses configured Shanghai timezone even on another host timezone'
   assert.equal(nextScheduledAt(state.settings, new Date('2026-11-02T18:59:30Z')), '2026-11-02T19:00:00.000Z');
   assert.equal(nextScheduledAt({ ...state.settings, schedulerEnabled: false }), null);
 });
-test('configuration rejects unsafe schemes, extreme probing, and invalid timezone', () => {
+test('configuration rejects unsafe schemes and extreme probing while fixing the timezone to Beijing', () => {
   assert.equal(sourceSchema.safeParse(sourceDefaults({ baseUrl: 'file:///etc/passwd' })).success, false);
   assert.equal(sourceSchema.safeParse(sourceDefaults({ baseUrl: 'https://example.com', requestIntervalMs: -1 })).success, false);
   assert.equal(settingsSchema.safeParse({ ...initialState().settings, sampleSegments: 100 }).success, false);
-  assert.equal(settingsSchema.safeParse({ ...initialState().settings, timezone: 'unknown' }).success, false);
+  assert.equal(settingsSchema.parse({ ...initialState().settings, timezone: 'unknown' }).timezone, 'Asia/Shanghai');
 });

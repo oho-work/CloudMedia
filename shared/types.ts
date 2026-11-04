@@ -10,9 +10,11 @@ export interface Source {
   referer: string; createdAt: string; lastRunAt: string | null; lastError: string | null;
   collectionMode?: CollectionMode | 'updates'; updatesSortedDescending?: boolean;
   startDate?: string; endDate?: string;
+  deletedRunScopes?: { day: string; dateRange?: DateRange }[];
+  scheduledSlots?: { day: string; time: string; dateRange?: DateRange }[];
 }
 export interface Settings {
-  dailyTime: string; timezone: string; schedulerEnabled: boolean;
+  dailyTime: string; dailyTimes?: string[]; timezone: string; schedulerEnabled: boolean;
   probeEnabled: boolean; sampleSegments: number; sampleBytes: number;
   probeTimeoutMs: number; preferredQuality: 'highest' | 'lowest';
   resourceRefreshHours: number;
@@ -69,6 +71,8 @@ export interface CollectionContext {
   existingResources?: (externalId: string) => CollectedResource[];
   knownPageUrls?: (externalId: string) => string[];
   onCheckpoint?: (movie: CollectedMovie) => Promise<void>;
+  /** Await the complete movie pipeline before releasing its collection slot. */
+  onMovie?: (movie: CollectedMovie) => Promise<void>;
 }
 export interface Dashboard {
   movieCount: number; resourceCount: number; sourceCount: number; enabledSourceCount: number;

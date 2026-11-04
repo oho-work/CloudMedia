@@ -230,7 +230,7 @@ test('HTML collection traverses every list page, more than thirty titles and eve
     ...context(), onCheckpoint: async movie => { if (movie.externalId === '/bulkdetail/1') firstMovieCheckpoints.push(movie.resources.length); },
   })) movies.push(movie);
   assert.equal(movies.length, 33); assert.equal(movies[0].resources.length, 31);
-  assert.deepEqual(firstMovieCheckpoints, [0, 5, 10, 15, 20, 25, 30, 31]);
+  assert.deepEqual(firstMovieCheckpoints, Array.from({ length: 32 }, (_, index) => index));
   assert.equal(new Set(movies.map(movie => movie.externalId)).size, 33);
   assert.equal(new Set(movies[0].resources.map(resource => resource.pageUrl)).size, 31);
 });

@@ -29,7 +29,7 @@ async function fixture(t: TestContext, failingSaves: number[], beforeSave?: (att
     if (failingSaves.includes(attempt)) throw new Error('fixture storage unavailable');
     durable = snapshot;
   } } as unknown as Store;
-  const worker = new Worker(store);
+  const worker = new Worker(store, { now: () => new Date() });
   t.mock.method(console, 'error', () => {});
   t.after(async () => {
     try { await worker.stop(); }

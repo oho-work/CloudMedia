@@ -30,8 +30,9 @@ test('configured custom User-Agent values survive normalization verbatim', () =>
   }
 });
 
-test('PostgreSQL startup loads and persists the migrated UA while preserving saved budgets', async t => {
-  const saved = { ...defaultSettings, userAgent: legacyDefaultUserAgent, sampleBytes: 345678, probeTimeoutMs: 43210 };
+test('PostgreSQL startup persists migrated UA and legacy schedule while preserving saved budgets', async t => {
+  const { dailyTimes: _dailyTimes, ...legacySettings } = defaultSettings;
+  const saved = { ...legacySettings, dailyTime: '22:15', timezone: 'UTC', userAgent: legacyDefaultUserAgent, sampleBytes: 345678, probeTimeoutMs: 43210 };
   const persisted: Record<string, unknown>[] = [];
   const client = {
     on() {}, release() {},
@@ -61,7 +62,12 @@ test('PostgreSQL startup loads and persists the migrated UA while preserving sav
   assert.equal(store.state.settings.userAgent, defaultChromeUserAgent);
   assert.equal(store.state.settings.sampleBytes, saved.sampleBytes);
   assert.equal(store.state.settings.probeTimeoutMs, saved.probeTimeoutMs);
+  assert.deepEqual(store.state.settings.dailyTimes, ['22:15']);
+  assert.equal(store.state.settings.dailyTime, '22:15');
+  assert.equal(store.state.settings.timezone, 'Asia/Shanghai');
   assert.equal(persisted.length, 1);
   assert.equal(persisted[0].userAgent, defaultChromeUserAgent);
   assert.equal(persisted[0].sampleBytes, saved.sampleBytes);
+  assert.deepEqual(persisted[0].dailyTimes, ['22:15']);
+  assert.equal(persisted[0].timezone, 'Asia/Shanghai');
 });

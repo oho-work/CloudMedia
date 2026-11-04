@@ -1,4 +1,5 @@
 import type { Settings } from '../shared/types.js';
+import { BEIJING_TIMEZONE, normalizedDailyTimes } from '../shared/schedule-settings.js';
 
 export function localMinute(date: Date, timezone: string) {
   const parts = new Intl.DateTimeFormat('en-CA', { timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(date);
@@ -7,9 +8,10 @@ export function localMinute(date: Date, timezone: string) {
 }
 export function nextScheduledAt(settings: Settings, now = new Date()): string | null {
   if (!settings.schedulerEnabled) return null;
+  const times = normalizedDailyTimes(settings);
   const cursor = new Date(Math.floor(now.getTime() / 60000) * 60000 + 60000);
   for (let minute = 0; minute < 60 * 49; minute++) {
-    if (localMinute(cursor, settings.timezone).time === settings.dailyTime) return cursor.toISOString();
+    if (times.includes(localMinute(cursor, BEIJING_TIMEZONE).time)) return cursor.toISOString();
     cursor.setTime(cursor.getTime() + 60000);
   }
   return null;

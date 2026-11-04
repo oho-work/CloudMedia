@@ -17,7 +17,7 @@ function fixture(t: TestContext, extra: Partial<Source> = {}) {
   // Keep the real worker before its first network operation; cleanup aborts before releasing writes.
   let release!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
-  const worker = new Worker({ state, async save() { await gate; } } as unknown as Store);
+  const worker = new Worker({ state, async save() { await gate; } } as unknown as Store, { now: () => new Date() });
   t.after(async () => { const stopped = worker.stop(); release(); await stopped; });
   return { source, state, worker };
 }
@@ -62,6 +62,7 @@ test('the daily scheduler uses each source configured collection scope', async t
   for (const mode of ['all', 'today', 'range'] as const) await t.test(mode, t => {
     const { source, state, worker } = fixture(t, { collectionMode: mode, enabled: true });
     state.settings.dailyTime = '00:00';
+    state.settings.dailyTimes = ['00:00'];
     worker.startScheduler();
     assert.equal(state.runs.length, 1);
     const run = state.runs[0];
@@ -104,7 +105,7 @@ test('the task API accepts each scope on an all source and rejects invalid date 
   const source = sourceDefaults({ id: 'scope-api', name: 'Fixture', baseUrl: 'https://example.invalid', listPath: 'file:///no-network', collectionMode: 'all' });
   state.sources = [source];
   const store = { state, healthy: true, mode: 'file', async save() {} } as unknown as Store;
-  const worker = new Worker(store);
+  const worker = new Worker(store, { now: () => new Date() });
   const previousToken = process.env.APP_AUTH_TOKEN;
   process.env.APP_AUTH_TOKEN = 'collection-options-fixture';
   const server = createServer(createApp(store, worker));

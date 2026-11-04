@@ -3,6 +3,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import type { CollectedMovie, CollectedResource, CollectionContext, Source } from '../shared/types.js';
 import { readTextLimited, safeFetch, safeUrlLabel } from './upstream.js';
 import { resolveDateRange, sourceDate } from './dates.js';
+import { concurrentBatch, TaskLimiter } from './concurrency.js';
 
 function text(value: any): string { return value === undefined || value === null ? '' : String(value).trim(); }
 function list(value: any): string[] { return Array.isArray(value) ? value.map(text).filter(Boolean) : text(value).split(/[,，、/]/).map(item => item.trim()).filter(Boolean); }
@@ -51,40 +52,21 @@ function playbackResponseUrls(content: { body: string; url: string }): string[] 
 class SourceClient {
   private lastRequest = 0;
   private requestStart: Promise<void> = Promise.resolve();
-  private requests = new Set<Promise<unknown>>();
+  private requests: TaskLimiter;
   readonly limit: number;
   constructor(private source: Source, private context: CollectionContext, private abort: (reason: unknown) => void = () => {}) {
     this.limit = Math.max(1, Math.min(20, Math.floor(source.concurrency || 1)));
-  }
-  /** Drain the whole batch before exposing results or propagating its first fatal error. */
-  async settledBatch<T, R>(items: readonly T[], action: (item: T, index: number) => Promise<R>): Promise<PromiseSettledResult<R>[]> {
-    return Promise.allSettled(items.map(async (item, index) => {
-      try { this.context.signal?.throwIfAborted(); return await action(item, index); }
-      catch (error) { this.abort(error); throw error; }
-    }));
-  }
-  async batch<T, R>(items: readonly T[], action: (item: T, index: number) => Promise<R>): Promise<R[]> {
-    const results = await this.settledBatch(items, action);
-    const rejected = results.find(result => result.status === 'rejected');
-    if (rejected?.status === 'rejected') throw this.context.signal?.reason ?? rejected.reason;
-    return results.map(result => (result as PromiseFulfilledResult<R>).value);
+    this.requests = new TaskLimiter(this.limit);
   }
   private headers(referer: string) {
     return { 'user-agent': this.context.settings.userAgent, accept: 'text/html,*/*;q=0.5', referer: new URL(referer).href };
   }
   async get(value: string, referer = this.source.baseUrl): Promise<{ body: string; url: string }> {
-    this.context.signal?.throwIfAborted();
-    while (this.requests.size >= this.limit) {
-      await Promise.race([...this.requests].map(request => request.catch(() => {})));
-      this.context.signal?.throwIfAborted();
-    }
-    const request = this.context.runSourceTask
+    return this.requests.run(() => this.context.runSourceTask
       ? this.context.runSourceTask(() => this.request(value, referer), this.context.signal)
-      : this.request(value, referer);
-    this.requests.add(request);
-    try { return await request; }
-    finally { this.requests.delete(request); }
+      : this.request(value, referer), this.context.signal);
   }
+  stop(reason: unknown) { this.abort(reason); }
   private async request(value: string, referer: string): Promise<{ body: string; url: string }> {
     const url = new URL(value);
     const interval = Math.max(0, this.source.requestIntervalMs);
@@ -286,46 +268,55 @@ async function populateHtmlResources(plan: HtmlPlan, client: SourceClient, conte
   }
   // New episodes win over old pages whose cached URLs need periodic refresh.
   const orderedPending = orderPlaybackPages(pending, knownPages);
-  let attemptedPages = 0;
+  const resolvedPages = new Map<number, CollectedResource[]>();
+  let lastCheckpoint = '';
+  const snapshotResources = () => {
+    const current = new Map(resources);
+    // Preserve episode order even when a later page finishes first.
+    for (let index = 0; index < orderedPending.length; index++) {
+      for (const resource of resolvedPages.get(index) ?? []) current.set(`${resource.url}|${resource.episode}|${resource.name}`, resource);
+    }
+    return [...current.values()];
+  };
   const checkpoint = async () => {
-    if (context.onCheckpoint) await context.onCheckpoint(structuredClone({ ...movie, resources: [...resources.values()] }));
+    if (!context.onCheckpoint) return;
+    const snapshot = { ...movie, resources: snapshotResources() };
+    const identity = JSON.stringify(snapshot);
+    if (identity === lastCheckpoint) return;
+    lastCheckpoint = identity;
+    await context.onCheckpoint(structuredClone(snapshot));
   };
   await checkpoint();
   try {
-    for (let offset = 0; offset < orderedPending.length; offset += client.limit) {
-      const pages = orderedPending.slice(offset, offset + client.limit);
-      const results = await client.settledBatch(pages, async (play, index) => {
-        context.log(`正在采集「${movie.title}」${play.name} / ${play.episode}（${offset + index + 1}/${orderedPending.length} 个播放页）`);
-        try { return await client.get(play.url, movie.pageUrl); }
-        catch (error) {
-          if (error instanceof StopError || context.signal?.aborted) throw error;
-          return undefined;
-        }
-      });
-      for (let index = 0; index < pages.length; index++) {
-        const result = results[index];
-        if (result.status === 'rejected') continue;
-        const play = pages[index]; const content = result.value;
+    // A worker owns a movie slot through probing; one playback-page producer per
+    // movie keeps a long series from filling the entire shared HTTP queue.
+    await concurrentBatch(orderedPending, context.onMovie ? 1 : client.limit, async (play, index) => {
+      try {
+        context.log(`正在采集「${movie.title}」${play.name} / ${play.episode}（${index + 1}/${orderedPending.length} 个播放页）`);
+        let content: { body: string; url: string } | undefined;
+        try { content = await client.get(play.url, movie.pageUrl); }
+        catch (error) { if (error instanceof StopError || context.signal?.aborted) throw error; }
         if (content) {
           const urls = playbackResponseUrls(content);
           if (!urls.length) {
             const message = `「${movie.title}」${play.name} / ${play.episode} 未发现公开 m3u8，保留影片资料及已有资源`;
             context.log(message); context.onCollectionError?.(message);
           }
-          for (const url of urls) resources.set(`${url}|${play.episode}|${play.name}`, { name: play.name, episode: play.episode, url, referer: content.url, pageUrl: content.url, resolvedAt: new Date().toISOString() });
+          resolvedPages.set(index, urls.map(url => ({ name: play.name, episode: play.episode, url, referer: content!.url, pageUrl: content!.url, resolvedAt: new Date().toISOString() })));
         } else {
           const message = `「${movie.title}」${play.episode} 播放页请求失败，保留影片资料及已有资源：${safeUrlLabel(play.url)}`;
           context.log(message); context.onCollectionError?.(message);
         }
-        attemptedPages++;
-        if (attemptedPages % 5 === 0) await checkpoint();
+        // Publish this page as soon as it is resolved, before waiting for any
+        // sibling page or movie, so its measurements can start immediately.
+        await checkpoint();
+      } catch (error) {
+        client.stop(error);
+        throw error;
       }
-      const rejected = results.find(result => result.status === 'rejected');
-      if (rejected?.status === 'rejected') throw context.signal?.reason ?? rejected.reason;
-      context.signal?.throwIfAborted();
-    }
+    }, context.signal);
   } finally { await checkpoint(); }
-  movie.resources = [...resources.values()];
+  movie.resources = snapshotResources();
   if (!movie.resources.length) {
     if (!playPages.size) {
       const message = `「${movie.title}」未匹配到播放链接，请检查播放链接 CSS 选择器或源站页面；已保留影片资料`;
@@ -381,92 +372,163 @@ async function* collectSourcePages(source: Source, context: CollectionContext, a
   const visited = new Set<string>();
   const visitedPages = new Set<string>();
   const visitedMovies = new Set<string>();
-  for (let page = 1; pageUrl; page++) {
-    const key = pageKey(pageUrl);
-    if (visitedPages.has(key)) {
-      if (dateRange) throw new Error('更新列表分页形成循环，日期范围采集未完成');
-      context.log('列表分页地址重复，已停止翻页'); break;
+  const active = new Set<Promise<void>>();
+  const completed = new Map<number, CollectedMovie | null>();
+  const ready: CollectedMovie[] = [];
+  let scheduled = 0; let nextResult = 0; let finished = false;
+  let failure: unknown; let failed = false; let fatal = false;
+  let notify!: () => void;
+  let changed = new Promise<void>(resolve => { notify = resolve; });
+  let decisions = Promise.resolve();
+  const wake = () => { notify(); changed = new Promise<void>(resolve => { notify = resolve; }); };
+  context.signal?.addEventListener('abort', wake);
+  const stop = (error: unknown) => {
+    if (!failed) { failed = true; failure = error; }
+    fatal = true;
+    abort(error); wake();
+  };
+  const capacity = async () => {
+    while (active.size + (context.onMovie ? ready.length : completed.size) >= client.limit) {
+      await changed;
+      context.signal?.throwIfAborted();
     }
-    visitedPages.add(key);
-    context.log(`读取页面第 ${page} 页`);
-    const response = await client.get(pageUrl, listingReferer); const $ = load(response.body);
-    listingReferer = response.url;
-    const finalKey = pageKey(response.url);
-    if (finalKey !== key && visitedPages.has(finalKey)) {
-      if (dateRange) throw new Error('更新列表重定向形成循环，日期范围采集未完成');
-      context.log('列表重定向至已访问页面，已停止翻页'); break;
-    }
-    visitedPages.add(finalKey);
-    const details = new Set<string>();
-    $(source.detailLinkSelector).each((_index, element) => {
-      const absoluteUrl = absolute($(element).attr('href') ?? '', response.url);
-      const url = absoluteUrl ? pageKey(absoluteUrl) : '';
-      if (url && new URL(url).origin === new URL(response.url).origin && !visited.has(url)) details.add(url);
-    });
-    if (!details.size && page === 1) {
-      if (dateRange && /暂无数据|暂无影片|没有找到|无相关内容/.test($('body').text())) break;
-      throw new Error('未发现影片详情链接，请检查详情链接 CSS 选择器');
-    }
-    if (!details.size && !dateRange) { context.log('列表没有新的影片链接，已停止翻页'); break; }
-    const detailUrls = [...details];
-    for (let offset = 0; offset < detailUrls.length && !reachedStart; offset += client.limit) {
-      const urls = detailUrls.slice(offset, offset + client.limit);
-      const results = await client.batch(urls, async detailUrl => {
-        visited.add(detailUrl);
-        try { return { detail: await client.get(detailUrl, response.url) }; }
-        catch (error) {
-          if (error instanceof StopError || context.signal?.aborted) throw error;
-          return { error };
-        }
-      });
-      const plans: HtmlPlan[] = [];
-      // Completion order must never let an older record hide preceding in-range titles.
-      for (let index = 0; index < urls.length; index++) {
+  };
+  const schedule = (detailUrl: string, referer: string) => {
+    const sequence = scheduled++;
+    const previousDecision = decisions;
+    let releaseDecision!: () => void;
+    decisions = new Promise<void>(resolve => { releaseDecision = resolve; });
+    const task = (async () => {
+      let detail: { body: string; url: string } | undefined;
+      let detailError: unknown;
+      try { detail = await client.get(detailUrl, referer); }
+      catch (error) {
+        if (error instanceof StopError || context.signal?.aborted) throw error;
+        detailError = error;
+      }
+      // Range decisions alone follow listing order. Playback and measurements
+      // remain independent once a movie has been accepted.
+      await previousDecision;
+      let plan: HtmlPlan;
+      try {
         context.signal?.throwIfAborted();
-        const detailUrl = urls[index]; const result = results[index]; const detail = result.detail;
+        if (reachedStart) return null;
         if (!detail) {
           if (dateRange) {
-            const message = `详情页请求失败，已记录后继续采集其他影片：${safeUrlLabel(detailUrl)}（${result.error instanceof Error ? result.error.message : '请求错误'}）`;
+            const message = `详情页请求失败，已记录后继续采集其他影片：${safeUrlLabel(detailUrl)}（${detailError instanceof Error ? detailError.message : '请求错误'}）`;
             context.log(message); context.onCollectionError?.(message);
           } else context.log(`详情页请求失败，已跳过：${safeUrlLabel(detailUrl)}`);
-          continue;
+          return null;
         }
         const movie = parseHtmlMovie(detail.body, source, detail.url, dateRange?.timezone ?? context.settings.timezone);
         if (!movie) {
           if (dateRange) throw new Error(`详情页没有匹配片名，无法完成日期范围采集：${safeUrlLabel(detailUrl)}`);
-          context.log('详情页没有匹配片名，已跳过'); continue;
+          context.log('详情页没有匹配片名，已跳过'); return null;
         }
         if (dateRange) {
           const updatedOn = movie.sourceUpdatedOn;
           if (!updatedOn) throw new Error(`「${movie.title}」没有有效的源站更新时间，无法按日期筛选`);
           if (updatedOn < dateRange.startDate) {
-            if (source.updatesSortedDescending) { reachedStart = true; break; }
-            continue;
+            if (source.updatesSortedDescending) reachedStart = true;
+            return null;
           }
-          if (updatedOn > dateRange.endDate) continue;
+          if (updatedOn > dateRange.endDate) return null;
         }
-        if (visitedMovies.has(movie.externalId)) continue;
+        if (visitedMovies.has(movie.externalId)) return null;
         visitedMovies.add(movie.externalId);
-        const plan = htmlPlan(movie, detail, source);
-        if (dateRange) {
-          // Save this bounded batch before resolving it; never defer playback
-          // until the entire date range has been scanned.
-          await context.onCheckpoint?.(structuredClone(movie));
-          count++;
-          context.log(`已发现 ${count} 部日期范围内影片，正在补齐播放资源`);
-        }
-        plans.push(plan);
+        plan = htmlPlan(movie, detail, source);
+        count++;
+        if (dateRange) context.log(`已发现 ${count} 部日期范围内影片，正在补齐播放资源`);
+      } finally { releaseDecision(); }
+      const movie = await populateHtmlResources(plan, client, context);
+      await context.onMovie?.(movie);
+      context.signal?.throwIfAborted();
+      return movie;
+    })().then(movie => {
+      if (context.onMovie) { if (movie) ready.push(movie); }
+      else completed.set(sequence, movie);
+    }, error => {
+      releaseDecision(); if (!context.onMovie) completed.set(sequence, null); stop(error);
+    }).finally(() => { active.delete(task); wake(); });
+    active.add(task);
+  };
+  const produce = async () => {
+    for (let page = 1; pageUrl && !reachedStart; page++) {
+      if (page > 1) await capacity();
+      context.signal?.throwIfAborted();
+      const key = pageKey(pageUrl);
+      if (visitedPages.has(key)) {
+        if (dateRange) throw new Error('更新列表分页形成循环，日期范围采集未完成');
+        context.log('列表分页地址重复，已停止翻页'); break;
       }
-      if (plans.length) {
-        const movies = await client.batch(plans, plan => populateHtmlResources(plan, client, context));
-        if (!dateRange) count += movies.length;
-        for (const movie of movies) { context.signal?.throwIfAborted(); yield movie; }
+      visitedPages.add(key);
+      context.log(`读取页面第 ${page} 页`);
+      const response = await client.get(pageUrl, listingReferer); const $ = load(response.body);
+      listingReferer = response.url;
+      const finalKey = pageKey(response.url);
+      if (finalKey !== key && visitedPages.has(finalKey)) {
+        if (dateRange) throw new Error('更新列表重定向形成循环，日期范围采集未完成');
+        context.log('列表重定向至已访问页面，已停止翻页'); break;
       }
+      visitedPages.add(finalKey);
+      const details = new Set<string>();
+      $(source.detailLinkSelector).each((_index, element) => {
+        const absoluteUrl = absolute($(element).attr('href') ?? '', response.url);
+        const url = absoluteUrl ? pageKey(absoluteUrl) : '';
+        if (url && new URL(url).origin === new URL(response.url).origin && !visited.has(url)) details.add(url);
+      });
+      if (!details.size && page === 1) {
+        if (dateRange && /暂无数据|暂无影片|没有找到|无相关内容/.test($('body').text())) break;
+        throw new Error('未发现影片详情链接，请检查详情链接 CSS 选择器');
+      }
+      if (!details.size && !dateRange) { context.log('列表没有新的影片链接，已停止翻页'); break; }
+      for (const detailUrl of details) {
+        await capacity();
+        context.signal?.throwIfAborted();
+        if (reachedStart) break;
+        visited.add(detailUrl);
+        schedule(detailUrl, response.url);
+      }
+      // Preserve ordered date early-stop before fetching the next listing,
+      // without waiting for accepted movies to finish their resource/probe work.
+      if (dateRange) await decisions;
+      if (reachedStart) { context.log('已到达开始日期之前的记录，停止翻页'); break; }
+      const nextHref = source.nextPageSelector ? $(source.nextPageSelector).first().attr('href') : undefined;
+      const next = nextHref ? absolute(nextHref, response.url) : '';
+      pageUrl = next && new URL(next).origin === new URL(response.url).origin && next !== pageUrl ? next : '';
     }
-    if (reachedStart) { context.log('已到达开始日期之前的记录，停止翻页'); break; }
-    const nextHref = source.nextPageSelector ? $(source.nextPageSelector).first().attr('href') : undefined;
-    const next = nextHref ? absolute(nextHref, response.url) : '';
-    pageUrl = next && new URL(next).origin === new URL(response.url).origin && next !== pageUrl ? next : '';
+  };
+  const producer = produce().catch(error => {
+    if (error instanceof StopError || context.signal?.aborted) stop(error);
+    else if (!failed) {
+      // A broken later listing must not discard accepted movies' playback
+      // resources. Stop discovery, finish their pipelines, then report failure.
+      failed = true; failure = error;
+    }
+  }).finally(async () => {
+    await Promise.all(active);
+    finished = true; wake();
+  });
+  try {
+    while (!finished || (context.onMovie ? ready.length > 0 : nextResult < scheduled)) {
+      if (failed && fatal) throw failure;
+      if (context.onMovie && ready.length) {
+        const movie = ready.shift()!;
+        wake();
+        yield movie;
+      }
+      else if (!context.onMovie && completed.has(nextResult)) {
+        const movie = completed.get(nextResult)!;
+        completed.delete(nextResult++);
+        wake();
+        if (movie) yield movie;
+      } else await changed;
+    }
+    if (failed) throw failure;
+  } finally {
+    if (!finished) { abort(new Error('采集结果读取已停止')); wake(); }
+    await producer;
+    context.signal?.removeEventListener('abort', wake);
   }
   context.log(`本次读取 ${count} 部影片`);
   if (dateRange && incompletePages) throw new Error(`已读取 ${count} 部影片；${incompletePages} 个页面未完整取得内容，详见任务错误，可重新采集补齐`);

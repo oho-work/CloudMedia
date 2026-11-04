@@ -8,22 +8,24 @@ import type { Store } from './store.js';
 import { PosterArchiver } from './poster-archive.js';
 import { emptyProbe } from './defaults.js';
 import { resolveDateRange } from './dates.js';
-import { concurrentBatch, TaskLimiter } from './concurrency.js';
+import { TaskLimiter } from './concurrency.js';
+import { appClock, type AppClock } from './clock.js';
+import { BEIJING_TIMEZONE, normalizedDailyTimes } from '../shared/schedule-settings.js';
 
 export class WorkerRequestError extends Error {
-  constructor(message: string, readonly status: 400 | 409) { super(message); }
+  constructor(message: string, readonly status: 400 | 409 | 503) { super(message); }
 }
 
-function collectionRange(source: Source, request: CollectionRequest, timezone: string): DateRange | undefined {
+function collectionRange(source: Source, request: CollectionRequest, timezone: string, now: Date): DateRange | undefined {
   const hasDates = request.startDate !== undefined || request.endDate !== undefined;
   const mode = request.mode || (hasDates ? 'range' : source.collectionMode === 'updates' ? 'today' : source.collectionMode || 'all');
   if (mode === 'all') return undefined;
   try {
-    if (mode === 'today') return resolveDateRange({}, timezone);
+    if (mode === 'today') return resolveDateRange({}, timezone, now);
     const dates = hasDates ? request : { startDate: source.startDate, endDate: source.endDate };
     // Old date-only API requests keep their single-day shorthand; configured/explicit ranges need both boundaries.
     if ((request.mode === 'range' || !hasDates) && (!dates.startDate || !dates.endDate)) throw new Error('区间采集需要开始日期和结束日期');
-    return resolveDateRange(dates, timezone);
+    return resolveDateRange(dates, timezone, now);
   } catch (error) { throw new WorkerRequestError(error instanceof Error ? error.message : '日期范围无效', 400); }
 }
 
@@ -42,16 +44,40 @@ export class Worker {
   private resourceLimiters = new Map<string, { limiter: TaskLimiter; pending: number }>();
   private frozenSourceLimits = new Map<string, number>();
   private timer?: ReturnType<typeof setInterval>;
+  private scheduling?: Promise<void>;
   readonly posters: PosterArchiver;
-  constructor(private store: Store) { this.posters = new PosterArchiver(store); }
+  constructor(private store: Store, private clock: Pick<AppClock, 'now'> = appClock) { this.posters = new PosterArchiver(store); }
+  rememberDeletedRun(run: Run) {
+    const instant = this.clock.now();
+    const source = this.store.state.sources.find(item => item.id === run.sourceId);
+    if (!source) return;
+    const started = localMinute(new Date(run.startedAt), BEIJING_TIMEZONE);
+    // History can be deleted while network time is unavailable. Preserve that
+    // run's claims now so synchronization cannot cause it to be scheduled again.
+    const today = instant ? localMinute(instant, BEIJING_TIMEZONE).day : started.day;
+    source.deletedRunScopes = (source.deletedRunScopes || []).filter(item => item.day === today);
+    if (started.day !== today) return;
+    if (!source.deletedRunScopes.some(item => sameRange(item.dateRange, run.dateRange))) {
+      source.deletedRunScopes.push({ day: today, ...(run.dateRange ? { dateRange: structuredClone(run.dateRange) } : {}) });
+    }
+    this.claimSchedule(source, today, normalizedDailyTimes(this.store.state.settings).filter(time => time <= started.time), run.dateRange);
+  }
+  private claimSchedule(source: Source, day: string, times: string[], dateRange?: DateRange) {
+    source.scheduledSlots = (source.scheduledSlots || []).filter(slot => slot.day === day);
+    for (const time of times) if (!source.scheduledSlots.some(slot => slot.time === time && sameRange(slot.dateRange, dateRange))) {
+      source.scheduledSlots.push({ day, time, ...(dateRange ? { dateRange: structuredClone(dateRange) } : {}) });
+    }
+  }
   enqueue(source: Source, request: CollectionRequest = {}): Run {
-    const dateRange = collectionRange(source, request, this.store.state.settings.timezone);
+    const instant = this.clock.now();
+    if (!instant) throw new WorkerRequestError('北京时间尚未完成网络校时，请稍后再采集', 503);
+    const dateRange = collectionRange(source, request, BEIJING_TIMEZONE, instant);
     const existing = this.store.state.runs.find(run => run.sourceId === source.id && ['queued', 'running'].includes(run.status));
     if (existing) {
       if (!sameRange(existing.dateRange, dateRange)) throw new WorkerRequestError('该源已有其他采集范围的任务，请等待完成或取消后重试', 409);
       return existing;
     }
-    const run: Run = { id: randomUUID(), sourceId: source.id, sourceName: source.name, status: 'queued', startedAt: new Date().toISOString(), finishedAt: null, scanned: 0, added: 0, updated: 0, resourceCount: 0, errors: [], message: '等待采集', ...(dateRange ? { dateRange } : {}) };
+    const run: Run = { id: randomUUID(), sourceId: source.id, sourceName: source.name, status: 'queued', startedAt: instant.toISOString(), finishedAt: null, scanned: 0, added: 0, updated: 0, resourceCount: 0, errors: [], message: '等待采集', ...(dateRange ? { dateRange } : {}) };
     this.store.state.runs.unshift(run);
     const snapshot = structuredClone(source);
     this.frozenSourceLimits.set(source.id, snapshot.concurrency || 1);
@@ -108,45 +134,83 @@ export class Worker {
             await this.store.save();
             return result;
           };
+          const movieProbes = new Map<string, { limiter: TaskLimiter; jobs: Map<string, Promise<void>> }>();
+          const activeProbes = new Set<Promise<void>>();
+          const scheduleProbes = (input: CollectedMovie, resources: Resource[]) => {
+            if (!this.store.state.settings.probeEnabled || signal.aborted) return;
+            let queue = movieProbes.get(input.externalId);
+            if (!queue) {
+              queue = { limiter: new TaskLimiter(1), jobs: new Map() };
+              movieProbes.set(input.externalId, queue);
+            }
+            for (const resource of resources) {
+              if (resource.probe.status !== 'pending') continue;
+              const identity = `${resource.id}:${resource.url}:${resource.resolvedAt || ''}`;
+              if (queue.jobs.has(identity)) continue;
+              const originalUrl = resource.url, resolvedAt = resource.resolvedAt;
+              const task = queue.limiter.run(async () => {
+                signal.throwIfAborted();
+                if (resource.url !== originalUrl || resource.resolvedAt !== resolvedAt || resource.probe.status !== 'pending') return;
+                run.message = `正在检测「${input.title}」${resource.name} / ${resource.episode}`;
+                const checked = await this.probe(resource, false, signal);
+                signal.throwIfAborted();
+                if (checked.probe.status === 'error' && run.errors.length < 30) run.errors.push(`${resource.episode}：${checked.probe.error}`);
+              }, signal).catch(error => { processingController.abort(error); throw error; });
+              queue.jobs.set(identity, task); activeProbes.add(task);
+              const pendingQueue = queue;
+              const release = () => {
+                activeProbes.delete(task);
+                if (pendingQueue.jobs.get(identity) === task) pendingQueue.jobs.delete(identity);
+              };
+              void task.then(release, release);
+            }
+          };
+          const checkpoint = async (input: CollectedMovie) => {
+            const result = await persist(input);
+            scheduleProbes(input, result.resources);
+            return result;
+          };
           const processMovie = async (input: CollectedMovie) => {
             try {
               signal.throwIfAborted();
-              // Metadata reaches storage before any slow poster download or stream probe.
-              const result = await persist(input);
-              await this.posters.archiveMovie(result.movie, input.poster, input.pageUrl, signal);
+              const result = await checkpoint(input);
+              // Incremental probes already run while playback pages are being
+              // resolved. A movie keeps its slot until both tasks finish.
+              const results = await Promise.allSettled([
+                this.posters.archiveMovie(result.movie, input.poster, input.pageUrl, signal),
+                Promise.all(movieProbes.get(input.externalId)?.jobs.values() ?? []),
+              ]);
+              const rejected = results.find(result => result.status === 'rejected');
+              if (rejected?.status === 'rejected') throw rejected.reason;
               signal.throwIfAborted();
-              if (this.store.state.settings.probeEnabled) {
-                await concurrentBatch(result.resources, source.concurrency || 1, async resource => {
-                  try {
-                    signal.throwIfAborted();
-                    if (resource.probe.status !== 'pending') return;
-                    run.message = `正在检测「${result.movie.title}」${resource.name} / ${resource.episode}`;
-                    const checked = await this.probe(resource, false, signal);
-                    signal.throwIfAborted();
-                    if (checked.probe.status === 'error' && run.errors.length < 30) run.errors.push(`${resource.episode}：${checked.probe.error}`);
-                  } catch (error) { processingController.abort(error); throw error; }
-                }, signal);
-              }
             } catch (error) { processingController.abort(error); throw error; }
+            finally { movieProbes.delete(input.externalId); }
           };
-          let batch: CollectedMovie[] = [];
-          for await (const input of collectSource(source, { settings, dateRange: run.dateRange, signal, runSourceTask: (action, taskSignal) => this.sourceLimiter(source.id).run(action, taskSignal), onCollectionError: message => { collectionErrors++; if (run.errors.length < 30) run.errors.push(message); }, log: message => { if (!signal.aborted) run.message = message; }, onCheckpoint: async input => { await persist(input); }, existingResources: externalId => {
-            const movie = this.store.state.movies.find(item => item.sourceRefs.some(ref => ref.sourceId === source.id && ref.externalId === externalId));
-            if (!movie) return [];
-            return this.store.state.resources.filter(item => item.movieId === movie.id && item.sourceId === source.id && item.probe.status !== 'error' && Date.now() - new Date(item.resolvedAt || item.createdAt).getTime() < settings.resourceRefreshHours * 3600000)
-              .map(item => ({ name: item.name, episode: item.episode, url: item.url, referer: item.referer, pageUrl: item.pageUrl, resolvedAt: item.resolvedAt || item.createdAt }));
-          }, knownPageUrls: externalId => {
-            const movie = this.store.state.movies.find(item => item.sourceRefs.some(ref => ref.sourceId === source.id && ref.externalId === externalId));
-            return this.store.state.resources.filter(item => item.movieId === movie?.id && item.sourceId === source.id && item.pageUrl).map(item => item.pageUrl!);
-          } })) {
-            signal.throwIfAborted();
-            batch.push(input);
-            if (batch.length >= (source.concurrency || 1)) {
-              await concurrentBatch(batch, source.concurrency || 1, processMovie, signal);
-              batch = [];
-            }
+          try {
+            for await (const _input of collectSource(source, {
+              settings, dateRange: run.dateRange, signal,
+              runSourceTask: (action, taskSignal) => this.sourceLimiter(source.id).run(action, taskSignal),
+              onCollectionError: message => { collectionErrors++; if (run.errors.length < 30) run.errors.push(message); },
+              log: message => { if (!signal.aborted) run.message = message; },
+              onCheckpoint: async input => { await checkpoint(input); },
+              onMovie: processMovie,
+              existingResources: externalId => {
+                const movie = this.store.state.movies.find(item => item.sourceRefs.some(ref => ref.sourceId === source.id && ref.externalId === externalId));
+                if (!movie) return [];
+                return this.store.state.resources.filter(item => item.movieId === movie.id && item.sourceId === source.id && item.probe.status !== 'error' && Date.now() - new Date(item.resolvedAt || item.createdAt).getTime() < settings.resourceRefreshHours * 3600000)
+                  .map(item => ({ name: item.name, episode: item.episode, url: item.url, referer: item.referer, pageUrl: item.pageUrl, resolvedAt: item.resolvedAt || item.createdAt }));
+              },
+              knownPageUrls: externalId => {
+                const movie = this.store.state.movies.find(item => item.sourceRefs.some(ref => ref.sourceId === source.id && ref.externalId === externalId));
+                return this.store.state.resources.filter(item => item.movieId === movie?.id && item.sourceId === source.id && item.pageUrl).map(item => item.pageUrl!);
+              },
+            })) { signal.throwIfAborted(); }
+          } finally {
+            // Checkpoints can have started probes before the generator yields.
+            // Cancellation/failure must drain those jobs before final run save.
+            await Promise.allSettled([...activeProbes]);
+            movieProbes.clear();
           }
-          await concurrentBatch(batch, source.concurrency || 1, processMovie, signal);
           signal.throwIfAborted();
           run.status = collectionErrors ? 'error' : 'success';
           run.message = `已扫描 ${run.scanned} 部，新增 ${run.added} 部，更新 ${run.updated} 部${collectionErrors ? `；${collectionErrors} 个播放页未取得地址，可重新采集补齐` : ''}`;
@@ -242,24 +306,45 @@ export class Worker {
     return task;
   }
   startScheduler() {
+    if (this.timer || this.stopping) return;
     this.posters.start();
-    const tick = async () => {
-      const settings = this.store.state.settings;
-      if (!settings.schedulerEnabled || this.stopping) return;
-      const now = localMinute(new Date(), settings.timezone);
-      if (now.time < settings.dailyTime) return;
-      for (const source of this.store.state.sources) {
-        if (!source.enabled) continue;
-        if (this.store.state.runs.some(run => run.sourceId === source.id && ['queued', 'running'].includes(run.status))) continue;
-        const scope = collectionRange(source, {}, settings.timezone);
-        const ranToday = this.store.state.runs.some(run => run.sourceId === source.id && localMinute(new Date(run.startedAt), settings.timezone).day === now.day && sameRange(run.dateRange, scope));
-        if (!ranToday) this.enqueue(source);
-      }
-      await this.store.save();
-    };
-    this.timer = setInterval(() => { void tick().catch(() => console.error('定时任务写入失败')); }, 30000);
+    this.timer = setInterval(() => { void this.tickScheduler().catch(() => console.error('定时任务写入失败')); }, 30000);
     this.timer.unref();
-    void tick().catch(() => console.error('定时任务初始化失败'));
+    void this.tickScheduler().catch(() => console.error('定时任务初始化失败'));
+  }
+  /** Each Beijing-time slot is claimed independently of deletable task history. */
+  tickScheduler(): Promise<void> {
+    if (this.scheduling) return this.scheduling;
+    const task = this.scheduleDue();
+    this.scheduling = task;
+    void task.finally(() => { if (this.scheduling === task) this.scheduling = undefined; }).catch(() => {});
+    return task;
+  }
+  private async scheduleDue() {
+    const settings = this.store.state.settings;
+    const instant = this.clock.now();
+    if (!settings.schedulerEnabled || this.stopping || !instant) return;
+    const now = localMinute(instant, BEIJING_TIMEZONE);
+    const times = normalizedDailyTimes(settings);
+    for (const source of this.store.state.sources) {
+      if (this.stopping) break;
+      if (!source.enabled) continue;
+      const scope = collectionRange(source, {}, BEIJING_TIMEZONE, instant);
+      // Import older runs as claims only for slots already elapsed when they started.
+      // Later times on the same day still receive their own scheduled run.
+      for (const run of this.store.state.runs) if (run.sourceId === source.id && sameRange(run.dateRange, scope)) {
+        const started = localMinute(new Date(run.startedAt), BEIJING_TIMEZONE);
+        if (started.day === now.day) this.claimSchedule(source, now.day, times.filter(time => time <= started.time), scope);
+      }
+      this.claimSchedule(source, now.day, [], scope);
+      if (this.store.state.runs.some(run => run.sourceId === source.id && ['queued', 'running'].includes(run.status))) continue;
+      const due = times.filter(time => time <= now.time && !source.scheduledSlots?.some(slot => slot.time === time && sameRange(slot.dateRange, scope)));
+      if (!due.length) continue;
+      // After downtime, coalesce elapsed slots into one catch-up run for this source.
+      this.claimSchedule(source, now.day, due, scope);
+      this.enqueue(source);
+    }
+    await this.store.save();
   }
   async stop() {
     this.stopping = true; clearInterval(this.timer); this.controller.abort();

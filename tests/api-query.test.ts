@@ -17,7 +17,7 @@ test('catalogue pagination rejects non-integer and non-finite queries without lo
   const store = new Store(); await store.init();
   const source = sourceDefaults({ baseUrl: 'https://catalog.example' });
   for (let index = 1; index <= 3; index++) upsertMovie(store.state, source, { externalId: String(index), pageUrl: '/', title: String(index), resources: [] });
-  const worker = new Worker(store); const server = createApp(store, worker).listen(0, '127.0.0.1');
+  const worker = new Worker(store, { now: () => new Date() }); const server = createApp(store, worker).listen(0, '127.0.0.1');
   await new Promise<void>(resolve => server.once('listening', resolve));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api/movies`;
   t.after(async () => {

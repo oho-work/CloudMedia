@@ -4,15 +4,15 @@ import { Activity, ArrowDownToLine, ArrowRight, Check, ChevronDown, ChevronLeft,
 import type { CollectionRequest, Dashboard, Movie, Resource, Run, Settings, Source } from '../shared/types';
 import { localPosterPath } from '../shared/poster-path';
 import { bytesToMegabytes, megabytesToBytes, millisecondsToSeconds, secondsToMilliseconds } from '../shared/settings-units';
+import { BEIJING_TIMEZONE, DAILY_TIME_PATTERN, MAX_DAILY_TIMES, normalizedDailyTimes } from '../shared/schedule-settings';
 
 type Page = 'library' | 'sources' | 'runs' | 'settings';
 type MovieList = { items: (Movie & { resourceCount: number })[]; total: number; page: number; limit: number; types: string[]; years: string[] };
 type CollectionMode = 'today' | 'all' | 'range';
-const collectionMode = (source: Partial<Source>): CollectionMode => source.collectionMode === 'updates' ? 'today' : source.collectionMode || 'all';
 const validCalendarDate = (value: string) => /^\d{4}-\d{2}-\d{2}$/.test(value) && Number.isFinite(new Date(`${value}T00:00:00Z`).getTime()) && new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) === value;
 const validDateRange = (startDate: string, endDate: string) => validCalendarDate(startDate) && validCalendarDate(endDate) && startDate <= endDate;
 const tokenKey = 'cloudmedia-token';
-const date = (value: string | null) => value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '尚未运行';
+const date = (value: string | null) => value ? new Date(value).toLocaleString('zh-CN', { timeZone: BEIJING_TIMEZONE, hour12: false }) : '尚未运行';
 const statusNames: Record<Run['status'], string> = { queued: '等待中', running: '采集中', success: '已完成', error: '失败', interrupted: '已中断' };
 const hasRating = (value: string) => Number.isFinite(Number(value)) && Number(value) > 0;
 const displayCredits = (value: string) => value.split(/[\/／]+/).map(name => name.trim()).filter(Boolean).join(' / ');
@@ -168,7 +168,7 @@ function Sources({ sources, dashboard, onEdit, onRun, onChanged, notify, onError
   };
   return <><div className="page-heading"><div><div className="eyebrow">COLLECTION SOURCES</div><h1>采集源</h1><p>管理内容入口，让最新的电影与剧集自动归档。</p></div><button className="button primary" onClick={() => onEdit('new')}><Plus size={17} />添加采集源</button></div><div className="info-strip"><ShieldCheck size={18} /><span>通过 CSS 选择器采集公开 HTML 页面。域名变化时编辑入口地址，本地影片资料会保留。</span></div>
     <div className="source-summary"><span>{sources.length} 个采集源</span><span><i className="status-dot online" />{dashboard?.enabledSourceCount ?? sources.filter(source => source.enabled).length} 个已启用</span></div>
-    {!sources.length ? <div className="panel empty-small"><Globe2 size={36} /><h3>连接你的第一个内容源</h3><p>设置站点入口和 CSS 选择器，然后手动采集验证结果。</p><button className="button secondary" onClick={() => onEdit('new')}><Plus size={16} />添加采集源</button></div> : <div className="source-grid">{sources.map(source => <article className="source-card" key={source.id}><div className="source-card-head"><span className="source-icon"><Globe2 size={22} /></span><div><h3>{source.name}</h3><span className={`badge ${source.enabled ? 'success' : 'muted'}`}>{source.enabled ? '已启用' : '已暂停'}</span></div><div className="source-toggle"><Toggle checked={source.enabled} label={`${source.name}启用状态`} onChange={() => void mutate(source, 'toggle')} /></div></div><a className="source-url" href={source.baseUrl} target="_blank" rel="noreferrer">{source.baseUrl}<ExternalLink size={12} /></a><div className="source-details"><div><span>解析方式</span><strong>HTML / CSS 选择器</strong></div><div><span>请求间隔</span><strong>{source.requestIntervalMs / 1000} 秒</strong></div><div><span>并发数</span><strong>{source.concurrency ?? 1}</strong></div><div><span>默认采集范围</span><strong>{collectionMode(source) === 'today' ? '今天' : collectionMode(source) === 'range' ? `${source.startDate || '待设置'} 至 ${source.endDate || '待设置'}` : '全部'}</strong></div><div><span>最近采集</span><strong>{date(source.lastRunAt)}</strong></div></div>{source.lastError && <div className="source-error"><CircleAlert size={13} /><span>{source.lastError}</span></div>}<div className="source-actions"><button className="button secondary" disabled={busy === source.id} onClick={() => void onRun(source)}>{busy === source.id ? <Spinner /> : <Play size={14} />}立即采集</button><button className="text-button" onClick={() => onEdit(source)}><Pencil size={14} />编辑</button><IconButton label={`删除${source.name}`} disabled={busy === source.id} onClick={() => void mutate(source, 'delete')}><Trash2 size={15} /></IconButton></div></article>)}</div>}
+    {!sources.length ? <div className="panel empty-small"><Globe2 size={36} /><h3>连接你的第一个内容源</h3><p>设置站点入口和 CSS 选择器，然后手动采集验证结果。</p><button className="button secondary" onClick={() => onEdit('new')}><Plus size={16} />添加采集源</button></div> : <div className="source-grid">{sources.map(source => <article className="source-card" key={source.id}><div className="source-card-head"><span className="source-icon"><Globe2 size={22} /></span><div><h3>{source.name}</h3><span className={`badge ${source.enabled ? 'success' : 'muted'}`}>{source.enabled ? '已启用' : '已暂停'}</span></div><div className="source-toggle"><Toggle checked={source.enabled} label={`${source.name}启用状态`} onChange={() => void mutate(source, 'toggle')} /></div></div><a className="source-url" href={source.baseUrl} target="_blank" rel="noreferrer">{source.baseUrl}<ExternalLink size={12} /></a><div className="source-details"><div><span>解析方式</span><strong>HTML / CSS 选择器</strong></div><div><span>请求间隔</span><strong>{source.requestIntervalMs / 1000} 秒</strong></div><div><span>并发数</span><strong>{source.concurrency ?? 1}</strong></div><div><span>采集范围</span><strong>运行时选择</strong></div><div><span>最近采集</span><strong>{date(source.lastRunAt)}</strong></div></div>{source.lastError && <div className="source-error"><CircleAlert size={13} /><span>{source.lastError}</span></div>}<div className="source-actions"><button className="button secondary" disabled={busy === source.id} onClick={() => void onRun(source)}>{busy === source.id ? <Spinner /> : <Play size={14} />}立即采集</button><button className="text-button" onClick={() => onEdit(source)}><Pencil size={14} />编辑</button><IconButton label={`删除${source.name}`} disabled={busy === source.id} onClick={() => void mutate(source, 'delete')}><Trash2 size={15} /></IconButton></div></article>)}</div>}
   </>;
 }
 
@@ -193,28 +193,32 @@ function CollectionScope({ mode, onModeChange, startDate, endDate, onStartDate, 
 }
 
 function CollectionModal({ source, onClose, onStarted }: { source: Source; onClose: () => void; onStarted: () => void }) {
-  const [timezone, setTimezone] = useState<string | null>(null);
-  const [mode, setMode] = useState<CollectionMode>(() => collectionMode(source));
-  const [startDate, setStartDate] = useState(source.startDate || '');
-  const [endDate, setEndDate] = useState(source.endDate || '');
+  const [clockReady, setClockReady] = useState(false);
+  const [clockRevision, setClockRevision] = useState(0);
+  const [mode, setMode] = useState<CollectionMode>('today');
+  const [startDate, setStartDate] = useState('');
+  const [endDate, setEndDate] = useState('');
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const todayIn = (zone: string) => {
-    const parts = new Intl.DateTimeFormat('en-CA', { timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date());
-    return ['year', 'month', 'day'].map(name => parts.find(part => part.type === name)!.value).join('-');
-  };
   useEffect(() => {
     let active = true;
-    api<Settings>('/settings').then(settings => {
-      if (active) { const today = todayIn(settings.timezone); setTimezone(settings.timezone); setStartDate(value => value || today); setEndDate(value => value || today); }
+    setLoading(true); setClockReady(false); setError('');
+    api<ServerTime>('/time').then(clock => {
+      if (!active) return;
+      if (!clock.synchronized || !clock.now) throw new Error('等待网络校时完成后才能开始采集，请稍后重试。');
+      const now = new Date(clock.now);
+      if (!Number.isFinite(now.getTime())) throw new Error('服务器北京时间无效，请稍后重试。');
+      const parts = new Intl.DateTimeFormat('en-CA', { timeZone: BEIJING_TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(now);
+      const today = ['year', 'month', 'day'].map(name => parts.find(part => part.type === name)!.value).join('-');
+      setStartDate(value => value || today); setEndDate(value => value || today); setClockReady(true);
     }).catch(e => { if (active) setError((e as Error).message); }).finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
-  }, []);
+  }, [clockRevision]);
   const close = () => { if (!busy) onClose(); };
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (!timezone || busy) return;
+    if (!clockReady || busy) return;
     if (mode === 'range' && !validDateRange(startDate, endDate)) { setError('请选择有效的日期区间，开始日期不能晚于结束日期。'); return; }
     setBusy(true); setError('');
     try {
@@ -226,36 +230,34 @@ function CollectionModal({ source, onClose, onStarted }: { source: Source; onClo
   };
   return <Modal title={`开始采集 · ${source.name}`} onClose={close}><form onSubmit={submit}>
     <div className="modal-body">
-      <p className="form-intro">本次可临时调整采集范围，源的默认设置保持不变。采集结果自动保存到资料库。</p>
+      <p className="form-intro">选择本次采集范围，默认采集今天更新的内容。采集结果自动保存到资料库。</p>
       {error && <div className="inline-error" role="alert">{error}</div>}
-      {loading ? <div className="loading-state"><Spinner />正在读取采集时区…</div> : timezone && <>
-        <div className="collection-date-heading"><span><Clock3 size={14} />{timezone}</span></div>
+      {loading ? <div className="loading-state"><Spinner />正在读取北京时间…</div> : clockReady ? <>
+        <div className="collection-date-heading"><span><Clock3 size={14} />北京时间</span></div>
         <CollectionScope mode={mode} onModeChange={value => { setMode(value); setError(''); }} startDate={startDate} endDate={endDate} onStartDate={setStartDate} onEndDate={setEndDate} disabled={busy} />
         <div className="subtle-note"><Database size={14} /><span>重复采集会更新已有记录，长任务可在“任务记录”查看进度或取消。</span></div>
-      </>}
+      </> : <button type="button" className="button secondary" onClick={() => setClockRevision(value => value + 1)}><RefreshCw size={14} />重新检查校时</button>}
     </div>
-    <div className="modal-actions"><button type="button" className="button secondary" disabled={busy} onClick={close}>取消</button><button className="button primary" disabled={loading || !timezone || busy}>{busy ? <Spinner /> : <Play size={15} />}开始采集</button></div>
+    <div className="modal-actions"><button type="button" className="button secondary" disabled={busy} onClick={close}>取消</button><button className="button primary" disabled={loading || !clockReady || busy}>{busy ? <Spinner /> : <Play size={15} />}开始采集</button></div>
   </form></Modal>;
 }
 
 function SourceModal({ source, onClose, onSaved }: { source: Source | 'new'; onClose: () => void; onSaved: () => void }) {
   const [form, setForm] = useState<Partial<Source>>(() => source === 'new' ? {
-    name: '', baseUrl: '', adapter: 'html', enabled: true, collectionMode: 'all', updatesSortedDescending: false,
+    name: '', baseUrl: '', adapter: 'html', enabled: true, collectionMode: 'today', updatesSortedDescending: false,
     listPath: '/', detailLinkSelector: 'a[href*="/voddetail/"]', titleSelector: 'h1', posterSelector: '.module-item-pic img, .vodlist_thumb img',
     descriptionSelector: '.module-info-introduction, .vod_content', resourceSelector: 'a[href*="/vodplay/"], a[href$=".m3u8"], a[href*=".m3u8?"], a[href*=".m3u8#"]',
     nextPageSelector: 'a[title="下一页"]', requestIntervalMs: 2500, concurrency: 1,
-  } : { ...source, collectionMode: collectionMode(source), concurrency: source.concurrency ?? 1 });
+  } : { ...source, concurrency: source.concurrency ?? 1 });
   const [saving, setSaving] = useState(false); const [error, setError] = useState('');
   const update = <K extends keyof Source>(key: K, value: Source[K]) => setForm(previous => ({ ...previous, [key]: value }));
-  const mode = collectionMode(form);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (mode === 'range' && !validDateRange(form.startDate || '', form.endDate || '')) { setError('请选择有效的日期区间，开始日期不能晚于结束日期。'); return; }
     const concurrency = form.concurrency ?? 1;
     if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 20) { setError('并发数必须为 1 至 20 的整数。'); return; }
     setSaving(true); setError('');
     try {
-      const input = { ...form, adapter: 'html', concurrency, collectionMode: mode, startDate: mode === 'range' ? form.startDate : undefined, endDate: mode === 'range' ? form.endDate : undefined, referer: '' };
+      const input = { ...form, adapter: 'html', concurrency, referer: '' };
       await api(source === 'new' ? '/sources' : `/sources/${source.id}`, { method: source === 'new' ? 'POST' : 'PUT', body: JSON.stringify(input) });
       onSaved();
     } catch (e) { setError((e as Error).message); }
@@ -263,7 +265,7 @@ function SourceModal({ source, onClose, onSaved }: { source: Source | 'new'; onC
   };
   return <Modal title={source === 'new' ? '添加采集源' : `编辑 · ${source.name}`} onClose={onClose}><form onSubmit={submit}>
     <div className="modal-body">
-      <p className="form-intro">设置网站入口、CSS 选择器和默认采集范围。</p>
+      <p className="form-intro">设置网站入口、CSS 选择器和采集并发。采集范围在“立即采集”时选择。</p>
       {error && <div className="inline-error" role="alert">{error}</div>}
       <div className="form-grid">
         <Field label="源名称"><input value={form.name} required maxLength={100} placeholder="例如：我的影视源" onChange={e => update('name', e.target.value)} /></Field>
@@ -271,8 +273,7 @@ function SourceModal({ source, onClose, onSaved }: { source: Source | 'new'; onC
         <p className="parser-description">通过 CSS 选择器读取公开 HTML 页面的影片资料和播放链接。</p>
         <Field label="网站入口" hint="域名变更后修改这里，已入库资料继续保留。" full><input type="url" value={form.baseUrl} placeholder="https://example.com" required onChange={e => update('baseUrl', e.target.value)} /></Field>
         <Field label="列表路径" hint="相对于网站入口的路径，例如 / 或 /vodshow/1.html。" full><input value={form.listPath} onChange={e => update('listPath', e.target.value)} required /></Field>
-        <div className="field full"><CollectionScope mode={mode} onModeChange={value => { update('collectionMode', value); setError(''); }} startDate={form.startDate || ''} endDate={form.endDate || ''} onStartDate={value => update('startDate', value)} onEndDate={value => update('endDate', value)} disabled={saving} /></div>
-        {mode !== 'all' && <div className="field full"><div className="collection-sort-setting"><div><strong>列表按更新时间倒序</strong><small>仅当列表保证从新到旧排列时启用；遇到早于开始日期的影片后停止翻页。</small></div><Toggle label="列表按更新时间倒序" checked={form.updatesSortedDescending ?? false} onChange={value => update('updatesSortedDescending', value)} /></div></div>}
+        <div className="field full"><div className="collection-sort-setting"><div><strong>列表按更新时间倒序</strong><small>仅当列表保证从新到旧排列时启用；按日期采集时，遇到早于开始日期的影片后停止翻页。</small></div><Toggle label="列表按更新时间倒序" checked={form.updatesSortedDescending ?? false} onChange={value => update('updatesSortedDescending', value)} /></div></div>
         <Field label="详情链接选择器" full><input value={form.detailLinkSelector} onChange={e => update('detailLinkSelector', e.target.value)} required /></Field>
         <Field label="标题选择器"><input value={form.titleSelector} onChange={e => update('titleSelector', e.target.value)} required /></Field>
         <Field label="海报选择器"><input value={form.posterSelector} onChange={e => update('posterSelector', e.target.value)} /></Field>
@@ -280,7 +281,7 @@ function SourceModal({ source, onClose, onSaved }: { source: Source | 'new'; onC
         <Field label="播放链接选择器" full hint="支持直接 m3u8 链接及公开播放页中的播放器地址。"><input value={form.resourceSelector} onChange={e => update('resourceSelector', e.target.value)} /></Field>
         <Field label="下一页选择器" full><input value={form.nextPageSelector} onChange={e => update('nextPageSelector', e.target.value)} /></Field>
         <Field label="请求间隔（秒）" hint="0 表示不额外等待；最多 60 秒，支持三位小数。"><input type="number" min={0} max={60} step={0.001} value={(form.requestIntervalMs ?? 2500) / 1000} onChange={e => update('requestIntervalMs', Math.round(Number(e.target.value) * 1000))} required /></Field>
-        <Field label="并发数" hint="同时获取详情、播放地址和检测分辨率的任务数；1 为串行。"><input type="number" min={1} max={20} step={1} value={form.concurrency ?? 1} onChange={e => update('concurrency', Number(e.target.value))} required /></Field>
+        <Field label="并发数" hint="同时处理的影片数，覆盖影片资料、播放资源、速度和分辨率检测；空闲后自动补位，1 为串行。"><input type="number" min={1} max={20} step={1} value={form.concurrency ?? 1} onChange={e => update('concurrency', Number(e.target.value))} required /></Field>
       </div>
     </div>
     <div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>取消</button><button className="button primary" disabled={saving}>{saving ? <Spinner /> : <Check size={16} />}保存采集源</button></div>
@@ -288,69 +289,92 @@ function SourceModal({ source, onClose, onSaved }: { source: Source | 'new'; onC
 }
 
 function Runs({ revision }: { revision: number }) {
-  const [runs, setRuns] = useState<Run[]>([]); const [loading, setLoading] = useState(true); const [error, setError] = useState(''); const [expanded, setExpanded] = useState<string | null>(null); const [canceling, setCanceling] = useState<string[]>([]);
-  useEffect(() => { let active = true; const load = async () => { try { const result = await api<Run[]>('/runs'); if (active) { setRuns(result); setError(''); } } catch (e) { if (active) setError((e as Error).message); } finally { if (active) setLoading(false); } }; void load(); const timer = setInterval(load, 4000); return () => { active = false; clearInterval(timer); }; }, [revision]);
+  const [runs, setRuns] = useState<Run[]>([]); const [loading, setLoading] = useState(true); const [error, setError] = useState(''); const [actionError, setActionError] = useState('');
+  const [expanded, setExpanded] = useState<string | null>(null); const [canceling, setCanceling] = useState<string[]>([]); const [deleting, setDeleting] = useState<string[]>([]);
+  const deletedRuns = useRef(new Set<string>());
+  useEffect(() => { let active = true; const load = async () => { try { const result = await api<Run[]>('/runs'); if (active) { setRuns(result.filter(run => !deletedRuns.current.has(run.id))); setError(''); } } catch (e) { if (active) setError((e as Error).message); } finally { if (active) setLoading(false); } }; void load(); const timer = setInterval(load, 4000); return () => { active = false; clearInterval(timer); }; }, [revision]);
   const cancelRun = async (id: string) => {
     if (canceling.includes(id)) return;
-    setCanceling(previous => [...previous, id]); setError('');
+    setCanceling(previous => [...previous, id]); setActionError('');
     try {
       const updated = await api<Run>(`/runs/${id}/cancel`, { method: 'POST' });
       setRuns(previous => previous.map(run => run.id === updated.id ? updated : run));
-    } catch (e) { setError((e as Error).message); }
+    } catch (e) { setActionError((e as Error).message); }
     finally { setCanceling(previous => previous.filter(item => item !== id)); }
   };
-  return <><div className="page-heading"><div><div className="eyebrow">COLLECTION ACTIVITY</div><h1>任务记录</h1><p>每一次发现、更新与异常，都有迹可循。</p></div><span className="badge"><RefreshCw size={12} />每 4 秒更新</span></div>{error && <div className="inline-error" role="alert">{error}</div>}<div className="panel runs-panel">{loading ? <div className="loading-state"><Spinner />读取任务记录…</div> : !runs.length ? <div className="empty-small"><Activity size={37} /><h3>还没有采集任务</h3><p>在采集源页面运行一次采集，或等待下次定时任务。</p></div> : <div className="table-scroll"><table className="runs-table"><thead><tr><th>采集源 / 时间</th><th>状态</th><th>扫描</th><th>新增 / 更新</th><th>播放资源</th><th>详情</th></tr></thead><tbody>{runs.map(run => <RunRow key={run.id} run={run} canceling={canceling.includes(run.id)} onCancel={() => void cancelRun(run.id)} expanded={expanded === run.id} onExpand={() => setExpanded(value => value === run.id ? null : run.id)} />)}</tbody></table></div>}</div></>;
+  const deleteRun = async (id: string) => {
+    if (deleting.includes(id)) return;
+    setDeleting(previous => [...previous, id]); setActionError('');
+    try {
+      await api(`/runs/${id}`, { method: 'DELETE' });
+      deletedRuns.current.add(id);
+      setRuns(previous => previous.filter(run => run.id !== id));
+      setExpanded(previous => previous === id ? null : previous);
+    } catch (e) { setActionError((e as Error).message); }
+    finally { setDeleting(previous => previous.filter(item => item !== id)); }
+  };
+  return <><div className="page-heading"><div><div className="eyebrow">COLLECTION ACTIVITY</div><h1>任务记录</h1><p>每一次发现、更新与异常，都有迹可循。删除已结束的记录会保留采集结果。</p></div><span className="badge"><RefreshCw size={12} />每 4 秒更新</span></div>{(actionError || error) && <div className="inline-error" role="alert">{actionError || error}</div>}<div className="panel runs-panel">{loading ? <div className="loading-state"><Spinner />读取任务记录…</div> : !runs.length ? <div className="empty-small"><Activity size={37} /><h3>还没有采集任务</h3><p>在采集源页面运行一次采集，或等待下次定时任务。</p></div> : <div className="table-scroll"><table className="runs-table"><thead><tr><th>采集源 / 时间</th><th>状态</th><th>扫描</th><th>新增 / 更新</th><th>播放资源</th><th>操作</th></tr></thead><tbody>{runs.map(run => <RunRow key={run.id} run={run} canceling={canceling.includes(run.id)} onCancel={() => void cancelRun(run.id)} deleting={deleting.includes(run.id)} onDelete={() => void deleteRun(run.id)} expanded={expanded === run.id} onExpand={() => setExpanded(value => value === run.id ? null : run.id)} />)}</tbody></table></div>}</div></>;
 }
-function RunRow({ run, expanded, onExpand, canceling, onCancel }: { run: Run; expanded: boolean; onExpand: () => void; canceling: boolean; onCancel: () => void }) {
-  return <><tr><td><strong>{run.sourceName}</strong><small>{date(run.startedAt)}</small>{run.dateRange && <small className="run-date-range">更新日期：{run.dateRange.startDate}{run.dateRange.endDate !== run.dateRange.startDate ? ' 至 ' + run.dateRange.endDate : ''}<br />{run.dateRange.timezone}</small>}{(run.status === 'running' || run.status === 'queued') && <small style={{ display: 'block', maxWidth: 320, marginTop: 8, whiteSpace: 'normal', overflowWrap: 'anywhere', lineHeight: 1.7 }}>{run.message || '等待采集'}</small>}</td><td><span className={`badge ${run.status === 'success' ? 'success' : run.status === 'error' ? 'danger' : run.status === 'running' ? 'working' : 'muted'}`}>{run.status === 'running' && <Spinner />}{statusNames[run.status]}</span></td><td>{run.scanned}</td><td><span className="text-green">+{run.added}</span><span className="text-muted"> / {run.updated}</span></td><td>{run.resourceCount}</td><td><div style={{ display: 'flex', alignItems: 'center', gap: 14, whiteSpace: 'nowrap' }}><button className="text-button" onClick={onExpand} aria-expanded={expanded}>{expanded ? '收起' : '查看'}<ChevronDown size={13} /></button>{(run.status === 'queued' || run.status === 'running') && <button className="text-button" onClick={onCancel} disabled={canceling} title="停止任务，保留已保存的采集结果">{canceling ? <Spinner /> : <X size={13} />}{canceling ? '取消中' : '取消'}</button>}</div></td></tr>{expanded && <tr className="run-details"><td colSpan={6}><div><strong>运行信息</strong><p>{run.message || '任务已创建，等待执行。'}</p><span>完成时间：{run.finishedAt ? date(run.finishedAt) : '进行中'}</span>{run.errors.length > 0 && <div className="run-error-list">{run.errors.map((message, index) => <p key={index}><CircleAlert size={13} />{message}</p>)}</div>}</div></td></tr>}</>;
+function RunRow({ run, expanded, onExpand, canceling, onCancel, deleting, onDelete }: { run: Run; expanded: boolean; onExpand: () => void; canceling: boolean; onCancel: () => void; deleting: boolean; onDelete: () => void }) {
+  const finished = run.status === 'success' || run.status === 'error' || run.status === 'interrupted';
+  return <><tr><td><strong>{run.sourceName}</strong><small>{date(run.startedAt)}</small>{run.dateRange && <small className="run-date-range">更新日期：{run.dateRange.startDate}{run.dateRange.endDate !== run.dateRange.startDate ? ' 至 ' + run.dateRange.endDate : ''}<br />{run.dateRange.timezone}</small>}{(run.status === 'running' || run.status === 'queued') && <small style={{ display: 'block', maxWidth: 320, marginTop: 8, whiteSpace: 'normal', overflowWrap: 'anywhere', lineHeight: 1.7 }}>{run.message || '等待采集'}</small>}</td><td><span className={`badge ${run.status === 'success' ? 'success' : run.status === 'error' ? 'danger' : run.status === 'running' ? 'working' : 'muted'}`}>{run.status === 'running' && <Spinner />}{statusNames[run.status]}</span></td><td>{run.scanned}</td><td><span className="text-green">+{run.added}</span><span className="text-muted"> / {run.updated}</span></td><td>{run.resourceCount}</td><td><div className="run-actions"><button className="text-button" onClick={onExpand} aria-expanded={expanded}>{expanded ? '收起' : '查看'}<ChevronDown size={13} /></button>{finished ? <button className="text-button run-delete" onClick={onDelete} disabled={deleting} aria-label={`删除${run.sourceName}的任务记录`} title="仅删除任务记录，已采集的影片和播放资源会保留">{deleting ? <Spinner /> : <Trash2 size={13} />}{deleting ? '删除中' : '删除记录'}</button> : <button className="text-button" onClick={onCancel} disabled={canceling} title="停止任务，保留已保存的采集结果">{canceling ? <Spinner /> : <X size={13} />}{canceling ? '取消中' : '取消'}</button>}</div></td></tr>{expanded && <tr className="run-details"><td colSpan={6}><div><strong>运行信息</strong><p>{run.message || '任务已创建，等待执行。'}</p><span>完成时间：{run.finishedAt ? date(run.finishedAt) : '进行中'}</span>{run.errors.length > 0 && <div className="run-error-list">{run.errors.map((message, index) => <p key={index}><CircleAlert size={13} />{message}</p>)}</div>}</div></td></tr>}</>;
 }
 
-type PosterArchiveSummary = { total: number; saved: number; pending: number; error: number; missing: number; running: boolean };
+type ServerTime = { now: string | null; timezone: string; synchronized: boolean; lastSyncedAt: string | null; source: string | null; error: string | null };
 
-function PosterArchiveSettings({ storage }: { storage: Dashboard['storage'] | undefined }) {
-  const [summary, setSummary] = useState<PosterArchiveSummary | null>(null);
-  const [error, setError] = useState(''); const [busy, setBusy] = useState(false); const [revision, setRevision] = useState(0);
+function ServerClock() {
+  const [sample, setSample] = useState<{ value: ServerTime; receivedAt: number } | null>(null);
+  const [clockNow, setClockNow] = useState<number | null>(null);
+  const [error, setError] = useState('');
   useEffect(() => {
-    let active = true; let timer: number | undefined;
+    let active = true;
     const load = async () => {
       try {
-        const result = await api<PosterArchiveSummary>('/archive/posters');
-        if (!active) return;
-        setSummary(result); setError('');
-        if (result.running || result.pending > 0) timer = window.setTimeout(() => { void load(); }, 5000);
+        const value = await api<ServerTime>('/time');
+        if (active) { setSample({ value, receivedAt: performance.now() }); setError(''); }
       } catch (e) { if (active) setError((e as Error).message); }
     };
     void load();
-    return () => { active = false; window.clearTimeout(timer); };
-  }, [revision]);
-  const retry = async () => {
-    setBusy(true); setError('');
-    try { setSummary(await api<PosterArchiveSummary>('/archive/posters/retry', { method: 'POST' })); setRevision(value => value + 1); }
-    catch (e) { setError((e as Error).message); }
-    finally { setBusy(false); }
-  };
-  return <section className="panel settings-section poster-archive-settings">
-    <div className="settings-section-heading"><span className="section-icon green"><ArrowDownToLine size={20} /></span><div><h2>图片归档</h2><p>{storage === 'postgres' ? '影片资料、资源检测结果和海报图片统一保存在 PostgreSQL，图片不会写入项目目录。' : '预览模式的图片仅保存在内存中，重启后需重新获取；图片不会写入项目目录。'}</p></div></div>
-    {error && <div className="inline-error" role="alert">{error}</div>}
-    {summary ? <dl className="poster-archive-counts" aria-label="图片归档统计">{[
-      ['影片总数', summary.total], ['已保存', summary.saved], ['待保存', summary.pending], ['失败', summary.error], ['无图片', summary.missing],
-    ].map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}</dl> : !error && <p className="poster-archive-loading"><Spinner />读取图片归档状态…</p>}
-    <div className="poster-archive-actions"><span role="status">{summary?.running ? <><Spinner />正在保存图片，每 5 秒更新进度</> : '补存历史图片，失败后可再次重试。'}</span><button type="button" className="button secondary" disabled={busy || summary?.running} onClick={() => void retry()}>{busy ? <Spinner /> : <ArrowDownToLine size={15} />}补存 / 重试图片</button></div>
-    <div className="subtle-note"><Database size={14} /><span>{storage === 'postgres' ? '浏览资料时从数据库读取海报，无需项目本地图片目录。' : '连接 PostgreSQL 后可永久保存海报。'}视频在点击播放后连接视频源。</span></div>
-  </section>;
+    const timer = window.setInterval(() => { void load(); }, 30000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, []);
+  useEffect(() => {
+    const anchor = sample?.value.now ? Date.parse(sample.value.now) : NaN;
+    if (!sample || !Number.isFinite(anchor)) { setClockNow(null); return; }
+    const tick = () => setClockNow(anchor + performance.now() - sample.receivedAt);
+    tick();
+    const timer = window.setInterval(tick, 1000);
+    return () => window.clearInterval(timer);
+  }, [sample]);
+  const synced = !!sample?.value.synchronized && !error;
+  const status = synced ? '已同步' : sample || error ? '未同步' : '校时中';
+  return <div className="server-clock">
+    <div><span className="server-clock-label">当前北京时间</span><strong>{synced && clockNow !== null ? date(new Date(clockNow).toISOString()) : '等待网络校时'}</strong></div>
+    <span className={`badge ${synced ? 'success' : 'muted'}`}><span className={`status-dot ${synced ? 'online' : ''}`} />{status}</span>
+    <p>{error || sample?.value.error || (sample?.value.lastSyncedAt ? `最近校时：${date(sample.value.lastSyncedAt)}` : '连接网络时间源后显示北京时间。')}</p>
+  </div>;
 }
 
 function SettingsPage({ dashboard, onSaved }: { dashboard: Dashboard | null; onSaved: () => void }) {
   const [settings, setSettings] = useState<Settings | null>(null); const [error, setError] = useState(''); const [busy, setBusy] = useState(false);
   const [sampleMegabytes, setSampleMegabytes] = useState('');
   const [timeoutSeconds, setTimeoutSeconds] = useState('');
-  const loadSettings = (result: Settings) => { setSettings(result); setSampleMegabytes(bytesToMegabytes(result.sampleBytes)); setTimeoutSeconds(millisecondsToSeconds(result.probeTimeoutMs)); };
+  const [newDailyTime, setNewDailyTime] = useState('09:00');
+  const loadSettings = (result: Settings) => { const dailyTimes = normalizedDailyTimes(result); setSettings({ ...result, dailyTimes, dailyTime: dailyTimes[0], timezone: BEIJING_TIMEZONE }); setSampleMegabytes(bytesToMegabytes(result.sampleBytes)); setTimeoutSeconds(millisecondsToSeconds(result.probeTimeoutMs)); };
   useEffect(() => { let active = true; api<Settings>('/settings').then(result => { if (active) loadSettings(result); }).catch(e => { if (active) setError(e.message); }); return () => { active = false; }; }, []);
   const update = <K extends keyof Settings>(key: K, value: Settings[K]) => setSettings(previous => previous ? ({ ...previous, [key]: value }) : previous);
-  const submit = async (event: FormEvent) => { event.preventDefault(); if (!settings) return; setBusy(true); setError(''); try { const input = { ...settings, sampleBytes: megabytesToBytes(sampleMegabytes), probeTimeoutMs: secondsToMilliseconds(timeoutSeconds) }; const result = await api<Settings>('/settings', { method: 'PUT', body: JSON.stringify(input) }); loadSettings(result); onSaved(); } catch (e) { setError((e as Error).message); } finally { setBusy(false); } };
-  return <><div className="page-heading"><div><div className="eyebrow">SYSTEM PREFERENCES</div><h1>系统设置</h1><p>安排采集节奏，配置符合实际需求的资源检测。</p></div></div>{error && <div className="inline-error" role="alert">{error}</div>}{!settings ? <div className="loading-state"><Spinner />读取配置…</div> : <form onSubmit={submit} className="settings-form"><section className="panel settings-section"><div className="settings-section-heading"><span className="section-icon"><Clock3 size={20} /></span><div><h2>每日采集</h2><p>在指定时区的固定时间，依次更新所有已启用的源。</p></div></div><div className="setting-toggle-row"><div><strong>启用定时任务</strong><small>下次运行：{dashboard?.schedulerNextAt ? date(dashboard.schedulerNextAt) : '未安排'}</small></div><Toggle checked={settings.schedulerEnabled} label="启用定时任务" onChange={value => update('schedulerEnabled', value)} /></div><div className="form-grid"><Field label="每日运行时间"><input type="time" value={settings.dailyTime} onChange={e => update('dailyTime', e.target.value)} required /></Field><Field label="时区"><input value={settings.timezone} onChange={e => update('timezone', e.target.value)} placeholder="Asia/Shanghai" required /></Field></div></section>
+  const dailyTimes = settings ? normalizedDailyTimes(settings) : [];
+  const updateTimes = (times: string[]) => { if (!times.length) return; const sorted = [...new Set(times)].sort(); setSettings(previous => previous ? { ...previous, dailyTimes: sorted, dailyTime: sorted[0], timezone: BEIJING_TIMEZONE } : previous); };
+  const addTime = () => {
+    if (!DAILY_TIME_PATTERN.test(newDailyTime)) { setError('请选择有效的每日运行时间。'); return; }
+    if (dailyTimes.includes(newDailyTime)) { setError('此运行时间已存在。'); return; }
+    if (dailyTimes.length >= MAX_DAILY_TIMES) { setError('每日运行时间最多 24 条。'); return; }
+    setError(''); updateTimes([...dailyTimes, newDailyTime]);
+  };
+  const submit = async (event: FormEvent) => { event.preventDefault(); if (!settings) return; setBusy(true); setError(''); try { const input = { ...settings, dailyTimes, dailyTime: dailyTimes[0], timezone: BEIJING_TIMEZONE, sampleBytes: megabytesToBytes(sampleMegabytes), probeTimeoutMs: secondsToMilliseconds(timeoutSeconds) }; const result = await api<Settings>('/settings', { method: 'PUT', body: JSON.stringify(input) }); loadSettings(result); onSaved(); } catch (e) { setError((e as Error).message); } finally { setBusy(false); } };
+  return <><div className="page-heading"><div><div className="eyebrow">SYSTEM PREFERENCES</div><h1>系统设置</h1><p>安排采集节奏，配置符合实际需求的资源检测。</p></div></div>{error && <div className="inline-error" role="alert">{error}</div>}{!settings ? <div className="loading-state"><Spinner />读取配置…</div> : <form onSubmit={submit} className="settings-form"><section className="panel settings-section"><div className="settings-section-heading"><span className="section-icon"><Clock3 size={20} /></span><div><h2>每日采集</h2><p>按北京时间的多个时间点，依次更新所有已启用的源。</p></div></div><ServerClock /><div className="setting-toggle-row"><div><strong>启用定时任务</strong><small>下次运行（北京时间）：{dashboard?.schedulerNextAt ? date(dashboard.schedulerNextAt) : '未安排'}</small></div><Toggle checked={settings.schedulerEnabled} label="启用定时任务" onChange={value => update('schedulerEnabled', value)} /></div><div className="daily-times-setting"><div className="daily-times-heading"><strong>每日运行时间</strong><span>北京时间 · 至少 1 条，最多 24 条</span></div><ul className="daily-times-list" aria-label="每日运行时间">{dailyTimes.map(time => <li key={time}><span><Clock3 size={14} />{time}</span><IconButton label={`删除每日运行时间 ${time}`} disabled={busy || dailyTimes.length === 1} onClick={() => updateTimes(dailyTimes.filter(value => value !== time))}><Trash2 size={14} /></IconButton></li>)}</ul><div className="daily-time-add"><Field label="新增运行时间"><input type="time" value={newDailyTime} onChange={e => setNewDailyTime(e.target.value)} disabled={busy || dailyTimes.length >= MAX_DAILY_TIMES} /></Field><button type="button" className="button secondary" onClick={addTime} disabled={busy || dailyTimes.length >= MAX_DAILY_TIMES}><Plus size={14} />添加时间</button></div><p className="daily-times-hint">相同时间只保存一次，按时间先后排列；最后一个时间不可删除。</p></div></section>
       <section className="panel settings-section"><div className="settings-section-heading"><span className="section-icon blue"><Wifi size={20} /></span><div><h2>m3u8 资源检测</h2><p>从采集服务器抽样下载视频分片，记录分辨率和真实下载速度。</p></div></div><div className="setting-toggle-row"><div><strong>采集后自动检测</strong><small>保存播放地址后，自动检测新增或变更的资源。</small></div><Toggle checked={settings.probeEnabled} label="采集后自动检测" onChange={value => update('probeEnabled', value)} /></div><div className="form-grid"><Field label="抽测分片数量" hint="默认 1 个；增加数量可减少单次波动。"><input type="number" min={1} max={10} value={settings.sampleSegments} onChange={e => update('sampleSegments', +e.target.value)} required /></Field><Field label="每个分片最多下载（MB）" hint="1 MB = 1,000,000 字节；范围 0.016384–4.194304 MB。"><input type="number" min={0.016384} max={4.194304} step={0.000001} value={sampleMegabytes} onChange={e => setSampleMegabytes(e.target.value)} required /></Field><Field label="单次请求超时（秒）" hint="范围 1–60 秒，支持三位小数。"><input type="number" min={1} max={60} step={0.001} value={timeoutSeconds} onChange={e => setTimeoutSeconds(e.target.value)} required /></Field><Field label="多清晰度优先选择"><select value={settings.preferredQuality} onChange={e => update('preferredQuality', e.target.value as Settings['preferredQuality'])}><option value="highest">最高画质</option><option value="lowest">最低画质</option></select></Field></div><div className="subtle-note"><CircleAlert size={14} />检测结果反映采集服务器到播放源的连接情况；分辨率无法可靠识别时显示为未知。</div></section>
-      <section className="panel settings-section"><div className="settings-section-heading"><span className="section-icon green"><ShieldCheck size={20} /></span><div><h2>采集请求</h2><p>通过请求间隔、有限重试与退避，控制对源站的访问频率。</p></div></div><div className="form-grid"><Field label="播放地址缓存时长（小时）" hint="默认 168 小时（7 天）。未过期的播放页复用已采集地址；缓存过期或上次检测失败时重新读取。"><input type="number" min={1} max={720} value={settings.resourceRefreshHours ?? 168} onChange={e => update('resourceRefreshHours', +e.target.value)} required /></Field><Field label="失败最大重试次数"><input type="number" min={0} max={4} value={settings.maxRetries} onChange={e => update('maxRetries', +e.target.value)} required /></Field><Field label="User-Agent" hint="默认使用当前 Chrome 桌面浏览器的 User-Agent，可按需修改。" full><input value={settings.userAgent} onChange={e => update('userAgent', e.target.value)} required maxLength={300} /></Field></div></section><PosterArchiveSettings storage={dashboard?.storage} /><div className="settings-save"><span><Database size={14} />{dashboard?.storage === 'postgres' ? '设置保存在 PostgreSQL' : '设置保存在本地数据文件'}</span><button className="button primary" disabled={busy}>{busy ? <Spinner /> : <Check size={16} />}保存设置</button></div></form>}</>;
+      <section className="panel settings-section"><div className="settings-section-heading"><span className="section-icon green"><ShieldCheck size={20} /></span><div><h2>采集请求</h2><p>通过请求间隔、有限重试与退避，控制对源站的访问频率。</p></div></div><div className="form-grid"><Field label="播放地址缓存时长（小时）" hint="仅缓存解析后的播放地址，不缓存视频内容。默认 168 小时（7 天）；地址过期或上次检测失败时重新解析播放页。"><input type="number" min={1} max={720} value={settings.resourceRefreshHours ?? 168} onChange={e => update('resourceRefreshHours', +e.target.value)} required /></Field><Field label="失败最大重试次数"><input type="number" min={0} max={4} value={settings.maxRetries} onChange={e => update('maxRetries', +e.target.value)} required /></Field><Field label="User-Agent" hint="默认使用当前 Chrome 桌面浏览器的 User-Agent，可按需修改。" full><input value={settings.userAgent} onChange={e => update('userAgent', e.target.value)} required maxLength={300} /></Field></div></section><div className="settings-save"><span><Database size={14} />{dashboard?.storage === 'postgres' ? '设置保存在 PostgreSQL' : '设置保存在本地数据文件'}</span><button className="button primary" disabled={busy}>{busy ? <Spinner /> : <Check size={16} />}保存设置</button></div></form>}</>;
 }
 
 function Player({ resource }: { resource: Resource }) {

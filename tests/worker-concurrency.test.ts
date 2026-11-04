@@ -70,7 +70,7 @@ async function fixture(t: TestContext, concurrency = 2, movieCount = 1, episodes
   Object.assign(state.settings, { schedulerEnabled: false, probeEnabled: true, maxRetries: 0, sampleBytes: 1024 });
   durable = structuredClone(state);
   const store = { state, async save() { const snapshot = structuredClone(state); await beforeSave?.(); durable = snapshot; snapshots.push(durable); } } as unknown as Store;
-  const worker = new Worker(store);
+  const worker = new Worker(store, { now: () => new Date() });
   const releaseWave = () => {
     for (const response of blocked) response.end('#EXTM3U\n#EXTINF:1,\n/segment.ts\n#EXT-X-ENDLIST\n');
     blocked.clear();
@@ -164,7 +164,7 @@ test('manual probes use the source concurrency and do not block another source',
   assert.equal(f.state.resources.filter(resource => resource.probe.status === 'ok').length, 5);
 });
 
-test('collection processes movie batches and episode probes concurrently after saving metadata', async t => {
+test('collection processes independent movies and probes after saving metadata', async t => {
   const f = await fixture(t, 2, 2, 2);
   const run = f.worker.enqueue(f.state.sources[0]);
   await waitFor(() => f.starts.length === 2, 'collection should begin two probes concurrently');
@@ -261,7 +261,7 @@ test('an in-flight manual refresh cannot replace a newer collected resource iden
 });
 
 test('cancelled collection drains active probes and retains saved resources without probe results', async t => {
-  const f = await fixture(t, 2);
+  const f = await fixture(t, 2, 2, 2);
   const run = f.worker.enqueue(f.state.sources[0]);
   await waitFor(() => f.starts.length === 2, 'two episode probes should start');
   await f.worker.cancel(run.id);
