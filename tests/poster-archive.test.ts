@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, readdir, rm, unlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -30,7 +30,7 @@ async function withoutTimerAdvance(t: TestContext, run: (signal: AbortSignal) =>
   }
 }
 
-test('poster archive persists local files, failures and recovered legacy images', async t => {
+test('poster archive stores image objects, failures and recovered legacy images without local files', async t => {
   const keys = ['DATABASE_URL', 'DATA_FILE', 'POSTER_DIR', 'ALLOW_PRIVATE_UPSTREAM'] as const;
   const previous = keys.map(key => process.env[key]);
   const directory = await mkdtemp(path.join(tmpdir(), 'cloudmedia-archive-'));
@@ -57,6 +57,11 @@ test('poster archive persists local files, failures and recovered legacy images'
   await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve));
   origin = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`;
   const store = new Store(); await store.init();
+  const images = new Map<string, PosterBinary>();
+  (store as unknown as { posters: PosterStorage }).posters = {
+    async get(key) { return images.get(key) || null; },
+    async put(value) { images.set(value.path, { ...value, data: Buffer.from(value.data) }); },
+  };
   const source = sourceDefaults({ baseUrl: origin, posterSelector: '.cover', respectRobots: false, requestIntervalMs: 0 }); store.state.sources = [source];
   const archiver = new PosterArchiver(store);
   const movie = (id: string, poster: string) => upsertMovie(store.state, source, { externalId: id, pageUrl: origin + '/detail', title: id, poster, resources: [] }).movie;
@@ -66,14 +71,15 @@ test('poster archive persists local files, failures and recovered legacy images'
     for (let index = 0; index < keys.length; index++) { if (previous[index] === undefined) delete process.env[keys[index]]; else process.env[keys[index]] = previous[index]; }
     await rm(directory, { recursive: true, force: true });
   });
-  await t.test('remote images become local files and database snapshots record their provenance', async () => {
+  await t.test('remote images become storage objects and catalog snapshots record their provenance', async () => {
     const item = movie('download', origin + '/poster.png');
     await archiver.archiveMovie(item);
     assert.match(item.poster, /^\/media\/posters\/[a-f0-9]{64}\.png$/);
     assert.equal(item.posterArchive?.status, 'saved');
     assert.equal(item.posterArchive?.originalUrl, origin + '/poster.png');
     assert.equal(item.posterArchive?.bytes, png.length);
-    assert.deepEqual(await readFile(path.join(process.env.POSTER_DIR!, path.basename(item.poster))), png);
+    assert.deepEqual(images.get(item.poster)?.data, png);
+    await assert.rejects(readdir(process.env.POSTER_DIR!), { code: 'ENOENT' });
     const snapshot = JSON.parse(await readFile(process.env.DATA_FILE!, 'utf8'));
     assert.equal(snapshot.movies.find((entry: {id:string}) => entry.id === item.id).posterArchive.status, 'saved');
   });
@@ -86,29 +92,29 @@ test('poster archive persists local files, failures and recovered legacy images'
     await archiver.archiveMovie(item, origin + '/retry.png', origin + '/detail', undefined, true);
     assert.equal(item.posterArchive?.status, 'saved'); assert.match(item.poster, /^\/media\/posters\//);
   });
-  await t.test('missing legacy local files recover from the stored detail page instead of silently passing', async () => {
+  await t.test('missing legacy images recover from the stored detail page instead of silently passing', async () => {
     const item = movie('legacy', '/media/posters/' + 'a'.repeat(64) + '.png');
     await archiver.archiveMovie(item);
     assert.equal(item.posterArchive?.status, 'saved');
     assert.equal(item.posterArchive?.originalUrl, origin + '/poster.png');
     assert.ok(requests.includes('/detail'));
   });
-  await t.test('missing files without a recoverable original page have an explicit persisted missing state', async () => {
+  await t.test('missing images without a recoverable original page have an explicit persisted missing state', async () => {
     const item = movie('unrecoverable', '/media/posters/' + 'b'.repeat(64) + '.png'); item.sourceRefs = [];
     await archiver.archiveMovie(item);
     assert.equal(item.poster, ''); assert.equal(item.posterArchive?.status, 'missing'); assert.ok(item.posterArchive?.error);
   });
-  await t.test('a good local image survives a failing replacement download', async () => {
+  await t.test('a good stored image survives a failing replacement download', async () => {
     const item = store.state.movies[0]; const savedPath = item.poster;
     await archiver.archiveMovie(item, origin + '/unavailable.png');
     assert.equal(item.poster, savedPath); assert.equal(item.posterArchive?.status, 'error');
-    assert.deepEqual(await readFile(path.join(process.env.POSTER_DIR!, path.basename(item.poster))), png);
+    assert.deepEqual(images.get(item.poster)?.data, png);
   });
-  await t.test('deleted archived files are detected and restored from saved origin information', async () => {
+  await t.test('deleted archived objects are detected and restored from saved origin information', async () => {
     const item = store.state.movies.find(entry => entry.title === 'legacy')!;
-    await unlink(path.join(process.env.POSTER_DIR!, path.basename(item.poster)));
+    images.delete(item.poster);
     await archiver.archiveMovie(item);
-    assert.equal(item.posterArchive?.status, 'saved'); assert.deepEqual(await readFile(path.join(process.env.POSTER_DIR!, path.basename(item.poster))), png);
+    assert.equal(item.posterArchive?.status, 'saved'); assert.deepEqual(images.get(item.poster)?.data, png);
   });
   await t.test('new poster information queued during a download is archived after the existing task', async () => {
     const item = movie('concurrent', origin + '/slow.png');
@@ -134,13 +140,13 @@ test('poster archive persists local files, failures and recovered legacy images'
     assert.equal(snapshot.movies.find((entry: {id:string}) => entry.id === item.id).posterArchive.originalUrl, origin + '/poster.png');
     assert.equal(item.posterArchive?.status, 'pending');
   });
-  await t.test('restoring a missing file from backup makes it visible even during failed-download backoff', async () => {
+  await t.test('restoring a missing storage object makes it visible even during failed-download backoff', async () => {
     fail = false;
     const item = movie('restore', origin + '/retry.png'); await archiver.archiveMovie(item);
-    const savedPath = item.poster; const filename = path.join(process.env.POSTER_DIR!, path.basename(savedPath));
-    await unlink(filename); fail = true; await archiver.archiveMovie(item);
+    const savedPath = item.poster; const saved = images.get(savedPath)!;
+    images.delete(savedPath); fail = true; await archiver.archiveMovie(item);
     assert.equal(item.poster, ''); assert.equal(item.posterArchive?.status, 'error');
-    await writeFile(filename, png); await archiver.archiveMovie(item);
+    images.set(savedPath, saved); await archiver.archiveMovie(item);
     assert.equal(item.poster, savedPath);
   });
   await t.test('zero source interval downloads images and redirects without advancing timer time', async t => {

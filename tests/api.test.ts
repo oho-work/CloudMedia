@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -174,11 +174,12 @@ test('API, collector, worker, HLS probing and file persistence work together', {
     const movie = detail.body.movie as Movie; const resource = detail.body.resources[0] as Resource;
     firstResourceId = resource.id;
     assert.equal(movie.title, '集成测试电影'); assert.equal(movie.year, '2026'); assert.deepEqual(movie.actors, ['甲', '乙']);
-    assert.match(movie.poster, /^\/media\/posters\//, 'poster must be cached in the isolated temporary directory');
+    assert.match(movie.poster, /^\/media\/posters\//, 'poster must be served from the preview memory store');
     assert.equal(movie.posterArchive?.status, 'saved');
     const posterResponse = await fetch(apiOrigin + movie.poster);
     assert.equal(posterResponse.status, 200); assert.match(posterResponse.headers.get('content-type') || '', /^image\/png/);
     assert.equal((await posterResponse.arrayBuffer()).byteLength, movie.posterArchive?.bytes);
+    await assert.rejects(readdir(process.env.POSTER_DIR!), { code: 'ENOENT' });
     assert.equal(resource.probe.status, 'ok', resource.probe.error ?? '');
     assert.equal(resource.probe.width, 1920); assert.equal(resource.probe.height, 1080);
     assert.equal(resource.probe.sampledSegments, 1); assert.equal(resource.probe.bytesRead, 16384);
@@ -189,7 +190,7 @@ test('API, collector, worker, HLS probing and file persistence work together', {
     assert.ok(persisted.resources[0].probeHistory.some((entry: {width:number}) => entry.width === 1920));
   });
 
-  await t.test('image archive summary is available and absent poster files return 404 instead of frontend HTML', async () => {
+  await t.test('image archive summary is available and absent images return 404 instead of frontend HTML', async () => {
     const summary = await request('/api/archive/posters');
     assert.equal(summary.status, 200); assert.equal(summary.body.total, 1); assert.equal(summary.body.saved, 1);
     const missing = await fetch(apiOrigin + '/media/posters/' + '0'.repeat(64) + '.png');
@@ -363,6 +364,8 @@ test('API, collector, worker, HLS probing and file persistence work together', {
     reloaded = new Store(); await reloaded.init();
     assert.equal(reloaded.mode, 'file'); assert.equal(reloaded.state.sources.length, 0);
     assert.equal(reloaded.state.movies[0].id, firstMovieId); assert.equal(reloaded.state.resources[0].id, firstResourceId);
+    assert.equal(await reloaded.posterStorage?.get(reloaded.state.movies[0].poster), null, 'preview image bytes must not survive restart on disk');
+    await assert.rejects(readdir(process.env.POSTER_DIR!), { code: 'ENOENT' });
     assert.equal(reloaded.state.resources[0].probe.status, 'ok');
     assert.equal(reloaded.state.resources[0].resolvedAt, refreshedResolvedAt);
     assert.match(reloaded.state.resources[0].url, /token=renewed-signature$/);

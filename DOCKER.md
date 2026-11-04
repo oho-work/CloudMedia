@@ -2,7 +2,9 @@
 
 提供 Node.js 24 多阶段镜像和 Docker Compose 配置。镜像构建前端及服务端，运行时使用普通用户；影视资料、任务、设置和海报二进制统一保存在 PostgreSQL，应用容器重建后继续保留。
 
-图片保存在 PostgreSQL 的 `poster_files` 表，页面通过 `/media/posters/...` 接口从数据库读取。应用不创建本地图片、JSON 数据或备份文件，不需要应用数据卷。页面不回退源站图片，后台补存及失败重试进度可在“系统设置”的“图片永久归档”查看。
+所有运行模式均禁止将图片写入项目或容器目录。未配置数据库时，开发预览图片只暂存在内存，重启后重新获取；`POSTER_DIR` 不再生效。
+
+图片保存在 PostgreSQL 的 `poster_files` 表，页面通过 `/media/posters/...` 接口从数据库读取。应用不创建本地图片、JSON 数据或备份文件，不需要应用数据卷。页面不回退源站图片，后台补存及失败重试进度可在“系统设置”的“图片归档”查看。
 
 需要 Docker Engine 或 Docker Desktop（Linux 容器模式）以及 Docker Compose v2。以下命令均在项目根目录运行。示例使用 PowerShell；Linux/macOS 将 `Copy-Item` 换成 `cp`。
 

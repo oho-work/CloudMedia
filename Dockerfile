@@ -19,13 +19,12 @@ FROM node:24-bookworm-slim AS runtime
 ENV NODE_ENV=production \
     HOST=0.0.0.0 \
     PORT=3001 \
-    DATA_FILE=/app/data/cloudmedia.json \
-    POSTER_DIR=/app/data/posters
+    DATA_FILE=/app/data/cloudmedia.json
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev \
     && npm cache clean --force \
-    && mkdir -p /app/data/posters \
+    && mkdir -p /app/data \
     && chown -R node:node /app/data
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/runtime ./runtime

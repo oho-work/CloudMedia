@@ -2,8 +2,9 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import pg from 'pg';
 import type { State } from '../shared/types.js';
-import { initialState, sourceDefaults } from './defaults.js';
+import { initialState, settingsDefaults, sourceDefaults } from './defaults.js';
 import { PostgresPosterStorage, posterTableSql, type PosterStorage } from './poster-storage.js';
+import { MemoryPosterStorage } from './memory-poster-storage.js';
 
 type Table = 'sources' | 'movies' | 'resources' | 'runs';
 const tables: Table[] = ['sources', 'movies', 'resources', 'runs'];
@@ -29,6 +30,7 @@ export class Store {
   get posterStorage(): PosterStorage | undefined { return this.posters; }
   constructor() {
     this.mode = process.env.DATABASE_URL ? 'postgres' : 'file';
+    if (this.mode === 'file') this.posters = new MemoryPosterStorage();
     this.schema = process.env.PGSCHEMA || 'cloudmedia';
     if (!/^[a-z_][a-z0-9_]*$/.test(this.schema)) throw new Error('PGSCHEMA 格式无效');
     this.file = path.resolve(process.env.DATA_FILE || './data/cloudmedia.json');
@@ -61,7 +63,7 @@ export class Store {
         await client.query(`CREATE INDEX IF NOT EXISTS movies_title ON "${this.schema}".movies ((data->>'title'))`);
         const settings = await client.query(`SELECT data FROM "${this.schema}".settings WHERE id='global'`);
         if (settings.rows.length) {
-          this.state.settings = { ...this.state.settings, ...settings.rows[0].data };
+          this.state.settings = settingsDefaults(settings.rows[0].data);
           for (const table of tables) {
             const rows = await client.query(`SELECT data FROM "${this.schema}".${table}`);
             // Compare saves to the stored rows before startup defaults or run recovery change them.
@@ -73,7 +75,7 @@ export class Store {
       } catch (error) { await client.query('ROLLBACK'); throw error; }
       finally { client.release(); }
     } else {
-      try { const data = JSON.parse(await readFile(this.file, 'utf8')); this.state = { ...this.state, ...data, settings: { ...this.state.settings, ...data.settings } }; }
+      try { const data = JSON.parse(await readFile(this.file, 'utf8')); this.state = { ...this.state, ...data, settings: settingsDefaults(data.settings) }; }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
     }
     this.state.sources = this.state.sources.map(source => sourceDefaults(source));

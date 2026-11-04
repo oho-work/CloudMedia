@@ -1,13 +1,23 @@
 import { randomUUID } from 'node:crypto';
 import type { ProbeResult, Settings, Source, State } from '../shared/types.js';
 const defaultResourceSelector = 'a[href*="/vodplay/"], a[href$=".m3u8"], a[href*=".m3u8?"], a[href*=".m3u8#"]';
+// Chrome Stable 157.0.8103.38, verified against Google's Chrome for Testing feed
+// on 2026-11-04. Modern desktop Chrome reduces the minor/build/patch UA fields.
+export const defaultChromeUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36';
+const legacyDefaultUserAgent = 'CloudMedia/0.1 (+local media catalog; public pages only)';
 export const defaultSettings: Settings = {
   dailyTime: '03:00', timezone: 'Asia/Shanghai', schedulerEnabled: true,
   probeEnabled: true, sampleSegments: 1, sampleBytes: 262144,
   probeTimeoutMs: 15000, preferredQuality: 'highest', maxRetries: 2,
   resourceRefreshHours: 168,
-  userAgent: 'CloudMedia/0.1 (+local media catalog; public pages only)',
+  userAgent: defaultChromeUserAgent,
 };
+/** Migrate only the former built-in UA; user-supplied browser strings stay intact. */
+export function settingsDefaults(input: Partial<Settings> = {}): Settings {
+  const userAgent = !input.userAgent?.trim() || input.userAgent.trim() === legacyDefaultUserAgent
+    ? defaultChromeUserAgent : input.userAgent;
+  return { ...defaultSettings, ...input, userAgent };
+}
 export const emptyProbe = (): ProbeResult => ({ status: 'pending', checkedAt: null,
   width: null, height: null, bandwidth: null, speedMbps: null, latencyMs: null,
   bytesRead: 0, durationMs: 0, sampledSegments: 0, playlistUrl: null, error: null });
@@ -34,4 +44,4 @@ export function sourceDefaults(input: Partial<Source> = {}): Source {
 }
 export const initialState = (): State => ({ sources: [
   sourceDefaults({ name: '555 影视', baseUrl: 'https://www.555k03.com', listPath: '/label/new.html', enabled: false }),
-], movies: [], resources: [], runs: [], settings: { ...defaultSettings } });
+], movies: [], resources: [], runs: [], settings: settingsDefaults() });

@@ -9,7 +9,6 @@ import { sourceDefaults } from './defaults.js';
 import { collectionRequestSchema, sourceSchema, settingsSchema } from './validation.js';
 import { nextScheduledAt } from './scheduler.js';
 import { playbackRouter } from './playback.js';
-import { posterDirectory } from './posters.js';
 import { localPosterPath } from '../shared/poster-path.js';
 
 const asyncRoute = (handler: (req: Request, res: Response) => Promise<unknown>) => (req: Request, res: Response, next: NextFunction) => { void handler(req, res).catch(next); };
@@ -127,20 +126,16 @@ export function createApp(store: Store, worker: Worker) {
   }));
   app.use('/api/play', playbackRouter(store));
   app.use('/api', (_req, res) => res.status(404).json({ error: '接口不存在' }));
-  if (store.mode === 'postgres') {
-    app.get('/media/posters/:filename', asyncRoute(async (req, res) => {
-      const posterPath = localPosterPath(`/media/posters/${req.params.filename}`);
-      if (!posterPath) { res.status(404).end(); return; }
-      // PostgreSQL deployments never fall back to a stale local image directory.
-      if (!store.healthy || !store.posterStorage) { res.status(503).end(); return; }
-      const poster = await store.posterStorage.get(posterPath);
-      if (!poster) { res.status(404).end(); return; }
-      res.set({ 'Content-Type': poster.mime, 'Cache-Control': 'public, max-age=2592000, immutable', ETag: `"${poster.sha256}"` });
-      res.send(poster.data);
-    }));
-  } else {
-    app.use('/media/posters', express.static(posterDirectory(), { dotfiles: 'deny', immutable: true, maxAge: '30d' }));
-  }
+  app.get('/media/posters/:filename', asyncRoute(async (req, res) => {
+    const posterPath = localPosterPath(`/media/posters/${req.params.filename}`);
+    if (!posterPath) { res.status(404).end(); return; }
+    // Every mode reads its explicit image store and never a local image directory.
+    if (!store.healthy || !store.posterStorage) { res.status(503).end(); return; }
+    const poster = await store.posterStorage.get(posterPath);
+    if (!poster) { res.status(404).end(); return; }
+    res.set({ 'Content-Type': poster.mime, 'Cache-Control': 'public, max-age=2592000, immutable', ETag: `"${poster.sha256}"` });
+    res.send(poster.data);
+  }));
   app.use('/media/posters', (_req, res) => res.status(404).end());
   app.use(express.static(path.resolve('dist'), { index: false }));
   app.get('*', (_req, res) => res.sendFile(path.resolve('dist/index.html'), error => { if (error && !res.headersSent) res.status(503).send('前端尚未构建，请运行 npm run dev 或 npm run build'); }));

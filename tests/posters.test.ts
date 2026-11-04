@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import os from 'node:os';
@@ -9,6 +9,8 @@ import { after, before, beforeEach, test } from 'node:test';
 import { defaultSettings } from '../server/defaults.js';
 import * as posters from '../server/posters.js';
 import type { PosterBinary, PosterStorage } from '../server/poster-storage.js';
+import { MemoryPosterStorage } from '../server/memory-poster-storage.js';
+import type { Settings } from '../shared/types.js';
 
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a9ioAAAAASUVORK5CYII=', 'base64');
 const gif = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
@@ -32,7 +34,16 @@ let server: Server;
 let oldDirectory: string | undefined;
 let oldPrivate: string | undefined;
 let slowStarted: (() => void) | undefined;
+let storage: MemoryPosterStorage;
+let upstreamRequests = 0;
 const settings = { ...defaultSettings, userAgent: 'PosterArchiveTest/1.0' };
+const archive = (url: string, referer: string, config: Settings, signal?: AbortSignal) => posters.archivePoster(url, referer, config, signal, undefined, storage);
+const inspect = (key: string) => posters.inspectPoster(key, storage);
+const cache = (url: string, referer: string, config: Settings) => posters.cachePoster(url, referer, config, storage);
+const corruptStorage = (key: string, data: Buffer, mime = 'image/png'): PosterStorage => ({
+  async get(requested) { return requested === key ? { path: key, data, mime, sha256: createHash('sha256').update(data).digest('hex'), downloadedAt: new Date().toISOString() } : null; },
+  async put() { throw new Error('unexpected write'); },
+});
 
 before(async () => {
   oldDirectory = process.env.POSTER_DIR;
@@ -41,6 +52,7 @@ before(async () => {
   process.env.POSTER_DIR = directory;
   process.env.ALLOW_PRIVATE_UPSTREAM = 'true';
   server = createServer((request, response) => {
+    upstreamRequests++;
     const empty = emptyFormats.find(format => request.url === `/empty-${format.extension}`);
     if (empty) { response.writeHead(200, { 'content-type': empty.mime }); response.end(empty.bytes); return; }
     switch (request.url) {
@@ -70,6 +82,8 @@ before(async () => {
 });
 
 beforeEach(async () => {
+  storage = new MemoryPosterStorage();
+  upstreamRequests = 0;
   for (const filename of await readdir(directory)) await rm(path.join(directory, filename), { force: true });
 });
 
@@ -84,91 +98,92 @@ after(async () => {
 const referer = 'https://source.example/movie';
 
 test('cachePoster rejects an HTML body disguised as an image instead of exposing the upstream URL', async () => {
-  await assert.rejects(posters.cachePoster(origin + '/html-as-png', referer, settings));
+  await assert.rejects(cache(origin + '/html-as-png', referer, settings));
   assert.deepEqual(await readdir(directory), []);
 });
 
-test('archivePoster saves bytes under their content digest and inspectPoster reads them after upstream disappears', async () => {
+test('archivePoster stores bytes under their content digest and inspectPoster reads them after upstream disappears', async () => {
   const standalone = createServer((_request, response) => { response.writeHead(200, { 'content-type': 'image/png' }); response.end(png); });
   await new Promise<void>(resolve => standalone.listen(0, '127.0.0.1', resolve));
   let archived: Awaited<ReturnType<typeof posters.archivePoster>>;
-  try { archived = await posters.archivePoster(`http://127.0.0.1:${(standalone.address() as AddressInfo).port}/image`, referer, settings); }
+  try { archived = await archive(`http://127.0.0.1:${(standalone.address() as AddressInfo).port}/image`, referer, settings); }
   finally { await new Promise<void>((resolve, reject) => standalone.close(error => error ? reject(error) : resolve())); }
   assert.equal(archived.path, `/media/posters/${sha}.png`);
   assert.equal(archived.sha256, sha);
   assert.equal(archived.mime, 'image/png');
   assert.equal(archived.bytes, png.length);
   assert.ok(Number.isFinite(Date.parse(archived.downloadedAt)));
-  assert.deepEqual(await readFile(path.join(directory, `${sha}.png`)), png);
-  assert.deepEqual(await posters.inspectPoster(archived.path), archived);
+  assert.deepEqual((await storage.get(archived.path))?.data, png);
+  assert.deepEqual(await inspect(archived.path), archived);
+  assert.deepEqual(await readdir(directory), []);
 });
 
-test('different upstream URLs with identical bytes share one permanent file', async () => {
-  const first = await posters.archivePoster(origin + '/png', referer, settings);
-  const second = await posters.archivePoster(origin + '/same-bytes', referer, settings);
+test('different upstream URLs with identical bytes share one stored image', async () => {
+  const first = await archive(origin + '/png', referer, settings);
+  const second = await archive(origin + '/same-bytes', referer, settings);
   assert.equal(first.path, second.path);
-  assert.equal(await posters.cachePoster(first.path, referer, settings), first.path);
-  assert.deepEqual(await readdir(directory), [`${sha}.png`]);
+  assert.equal(await cache(first.path, referer, settings), first.path);
+  assert.deepEqual(await inspect(first.path), first);
+  assert.deepEqual(await readdir(directory), []);
 });
 
 test('GIF bytes retain the detected file format', async () => {
-  const result = await posters.archivePoster(origin + '/gif', referer, settings);
+  const result = await archive(origin + '/gif', referer, settings);
   assert.equal(result.mime, 'image/gif');
   assert.match(result.path, /^\/media\/posters\/[a-f0-9]{64}\.gif$/);
-  assert.deepEqual(await readFile(path.join(directory, path.basename(result.path))), gif);
+  assert.deepEqual((await storage.get(result.path))?.data, gif);
 });
 
 for (const format of emptyFormats) {
   test(`${format.name} signature without a complete image structure is rejected during download`, async () => {
-    await assert.rejects(posters.archivePoster(origin + `/empty-${format.extension}`, referer, settings));
+    await assert.rejects(archive(origin + `/empty-${format.extension}`, referer, settings));
     assert.deepEqual(await readdir(directory), []);
   });
-  test(`${format.name} signature without a complete image structure is rejected during local inspection`, async () => {
+  test(`${format.name} signature without a complete image structure is rejected during stored image inspection`, async () => {
     const filename = `${'0'.repeat(64)}.${format.extension}`;
-    await writeFile(path.join(directory, filename), format.bytes);
-    assert.equal(await posters.inspectPoster(`/media/posters/${filename}`), null);
+    const key = `/media/posters/${filename}`;
+    assert.equal(await posters.inspectPoster(key, corruptStorage(key, format.bytes, format.mime)), null);
   });
 }
 
 for (const format of [{ route: '/jpeg', mime: 'image/jpeg', extension: 'jpg', bytes: jpeg }, { route: '/webp', mime: 'image/webp', extension: 'webp', bytes: webp }, { route: '/avif', mime: 'image/avif', extension: 'avif', bytes: avif }]) {
   test(`complete ${format.extension} images remain archivable`, async () => {
-    const archived = await posters.archivePoster(origin + format.route, referer, settings);
+    const archived = await archive(origin + format.route, referer, settings);
     assert.equal(archived.mime, format.mime);
     assert.ok(archived.path.endsWith(`.${format.extension}`));
-    assert.deepEqual(await readFile(path.join(directory, path.basename(archived.path))), format.bytes);
-    assert.deepEqual(await posters.inspectPoster(archived.path), archived);
+    assert.deepEqual((await storage.get(archived.path))?.data, format.bytes);
+    assert.deepEqual(await inspect(archived.path), archived);
   });
 }
 
 test('AVIF with valid metadata and embedded idat image data remains archivable', async () => {
-  const archived = await posters.archivePoster(origin + '/avif-idat', referer, settings);
+  const archived = await archive(origin + '/avif-idat', referer, settings);
   assert.equal(archived.mime, 'image/avif');
-  assert.deepEqual(await readFile(path.join(directory, path.basename(archived.path))), avifIdat);
+  assert.deepEqual((await storage.get(archived.path))?.data, avifIdat);
 });
 
 for (const route of ['/wrong-mime', '/empty', '/truncated', '/oversize-header', '/oversize-stream', '/missing']) {
   test(`archivePoster rejects ${route} without saving a partial or fallback file`, async () => {
-    await assert.rejects(posters.archivePoster(origin + route, referer, settings));
+    await assert.rejects(archive(origin + route, referer, settings));
     assert.deepEqual(await readdir(directory), []);
   });
 }
 
-test('inspectPoster refuses unsafe paths and missing or corrupt local files', async () => {
-  for (const value of ['', '/media/posters/../../secret', `https://upstream.example/${sha}.png`, `/media/posters/${sha}.png?x=1`, `/media/posters/${sha.toUpperCase()}.png`, `/media/posters/${sha}.png`]) {
-    assert.equal(await posters.inspectPoster(value), null);
+test('inspectPoster refuses unsafe paths and missing or corrupt stored images', async () => {
+  for (const value of ['', '/media/posters/../../secret', `https://upstream.example/${sha}.png`, `/media/posters/${sha}.png?x=1`, `/media/posters/${sha.toUpperCase()}.png`, `/media/posters/${sha}.png\n`, `/media/posters/${sha}.png`]) {
+    assert.equal(await inspect(value), null);
   }
-  await writeFile(path.join(directory, `${sha}.png`), '<html>not an image</html>');
-  assert.equal(await posters.inspectPoster(`/media/posters/${sha}.png`), null);
-  await writeFile(path.join(directory, `${sha}.png`), png.subarray(0, 8));
-  assert.equal(await posters.inspectPoster(`/media/posters/${sha}.png`), null);
-  await writeFile(path.join(directory, `${sha}.png`), Buffer.alloc(maxBytes + 1));
-  assert.equal(await posters.inspectPoster(`/media/posters/${sha}.png`), null);
+  for (const data of [Buffer.from('<html>not an image</html>'), png.subarray(0, 8), Buffer.alloc(maxBytes + 1)]) {
+    const key = `/media/posters/${sha}.png`;
+    assert.equal(await posters.inspectPoster(key, corruptStorage(key, data)), null);
+  }
 });
 
 test('inspectPoster accepts legacy URL-hashed names and reports the actual content digest', async () => {
   const oldName = '0'.repeat(64);
-  await writeFile(path.join(directory, `${oldName}.png`), png);
-  const result = await posters.inspectPoster(`/media/posters/${oldName}.png`);
+  const key = `/media/posters/${oldName}.png`;
+  await storage.put({ path: key, sha256: sha, mime: 'image/png', data: png, downloadedAt: new Date().toISOString() });
+  const result = await inspect(key);
   assert.equal(result?.path, `/media/posters/${oldName}.png`);
   assert.equal(result?.sha256, sha);
   assert.equal(result?.bytes, png.length);
@@ -177,7 +192,7 @@ test('inspectPoster accepts legacy URL-hashed names and reports the actual conte
 test('cancelling an active download rejects without leaving a partial file', async () => {
   const controller = new AbortController();
   const started = new Promise<void>(resolve => { slowStarted = resolve; });
-  const download = posters.archivePoster(origin + '/slow', referer, settings, controller.signal);
+  const download = archive(origin + '/slow', referer, settings, controller.signal);
   await started;
   controller.abort();
   await assert.rejects(download, /取消|abort/i);
@@ -187,7 +202,31 @@ test('cancelling an active download rejects without leaving a partial file', asy
 
 test('a pre-cancelled download never creates a file', async () => {
   const controller = new AbortController(); controller.abort();
-  await assert.rejects(posters.archivePoster(origin + '/png', referer, settings, controller.signal));
+  await assert.rejects(archive(origin + '/png', referer, settings, controller.signal));
+  assert.deepEqual(await readdir(directory), []);
+});
+
+test('missing image storage rejects before any upstream request and never reads legacy local images', async () => {
+  await writeFile(path.join(directory, `${sha}.png`), png);
+  await assert.rejects(posters.archivePoster(origin + '/png', referer, settings), /未配置图片存储/);
+  assert.equal(await posters.inspectPoster(`/media/posters/${sha}.png`), null);
+  assert.equal(upstreamRequests, 0);
+});
+
+test('preview image storage validates data, copies buffers, and refuses immutable path collisions', async () => {
+  const saved = await archive(origin + '/png', referer, settings);
+  const first = (await storage.get(saved.path))!;
+  first.data.fill(0);
+  assert.deepEqual((await storage.get(saved.path))?.data, png);
+  const input: PosterBinary = { ...saved, data: Buffer.from(png) };
+  const alternate = new MemoryPosterStorage();
+  await alternate.put(input); input.data.fill(0);
+  assert.deepEqual((await alternate.get(saved.path))?.data, png);
+  await alternate.put((await storage.get(saved.path))!);
+  const collision = Buffer.from(png); collision[collision.length - 1] ^= 1;
+  await assert.rejects(alternate.put({ ...input, data: collision, sha256: createHash('sha256').update(collision).digest('hex') }), /拒绝覆盖/);
+  await assert.rejects(alternate.put({ ...input, data: Buffer.from('invalid') }), /无效/);
+  await assert.rejects(alternate.put({ ...(await storage.get(saved.path))!, path: saved.path + '\n' }), /无效/);
   assert.deepEqual(await readdir(directory), []);
 });
 

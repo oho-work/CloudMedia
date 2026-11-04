@@ -1,6 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
-import { lstat, mkdir, open, rename, stat, unlink, writeFile } from 'node:fs/promises';
-import path from 'node:path';
+import { createHash } from 'node:crypto';
 import type { Settings } from '../shared/types.js';
 import { safeFetch } from './upstream.js';
 import type { PosterBinary, PosterStorage } from './poster-storage.js';
@@ -9,7 +7,6 @@ export interface PosterFile {
   path: string; sha256: string; mime: string; bytes: number; downloadedAt: string;
 }
 
-export const posterDirectory = () => path.resolve(process.env.POSTER_DIR || './data/posters');
 const maxBytes = 4 * 1024 * 1024;
 const localPattern = /^\/media\/posters\/([a-f0-9]{64})\.(jpg|png|webp|avif|gif)$/;
 const formats: Record<string, string> = {
@@ -172,7 +169,7 @@ function detectMime(bytes: Buffer): string | null {
 /** Validate archived bytes before returning their metadata or serving them. */
 export function inspectPosterBinary(value: PosterBinary): PosterFile | null {
   const match = localPattern.exec(value.path);
-  if (!match || !Buffer.isBuffer(value.data) || value.data.length <= 0 || value.data.length > maxBytes) return null;
+  if (!match || match[0] !== value.path || !Buffer.isBuffer(value.data) || value.data.length <= 0 || value.data.length > maxBytes) return null;
   const mime = detectMime(value.data);
   if (!mime || mime !== value.mime || formats[mime] !== match[2] || !Number.isFinite(Date.parse(value.downloadedAt))) return null;
   const sha256 = createHash('sha256').update(value.data).digest('hex');
@@ -182,41 +179,16 @@ export function inspectPosterBinary(value: PosterBinary): PosterFile | null {
 
 /** Validate an archived poster without contacting its former upstream. */
 export async function inspectPoster(localPath: string, storage?: PosterStorage): Promise<PosterFile | null> {
-  const match = localPattern.exec(localPath);
-  if (!match) return null;
-  if (storage) {
-    const stored = await storage.get(localPath);
-    return stored?.path === localPath ? inspectPosterBinary(stored) : null;
-  }
-  const filename = path.join(posterDirectory(), `${match[1]}.${match[2]}`);
-  try {
-    const info = await lstat(filename);
-    if (!info.isFile() || info.size <= 0 || info.size > maxBytes) return null;
-    const file = await open(filename, 'r');
-    let bytes: Buffer;
-    try {
-      // Bound reads independently of stat, including when a file changes during inspection.
-      const buffer = Buffer.alloc(info.size + 1);
-      let total = 0;
-      while (total < buffer.length) {
-        const chunk = await file.read(buffer, total, buffer.length - total, null);
-        if (!chunk.bytesRead) break;
-        total += chunk.bytesRead;
-      }
-      if (total !== info.size) return null;
-      bytes = buffer.subarray(0, total);
-    } finally { await file.close(); }
-    const mime = detectMime(bytes);
-    if (!mime || formats[mime] !== match[2]) return null;
-    return { path: localPath, sha256: createHash('sha256').update(bytes).digest('hex'), mime,
-      bytes: bytes.length, downloadedAt: info.mtime.toISOString() };
-  } catch { return null; }
+  if (localPattern.exec(localPath)?.[0] !== localPath || !storage) return null;
+  const stored = await storage.get(localPath);
+  return stored?.path === localPath ? inspectPosterBinary(stored) : null;
 }
 
 /** Download a bounded, signature-checked image into permanent content-addressed storage. */
 export async function archivePoster(url: string, referer: string, settings: Settings, signal?: AbortSignal,
   beforeRequest?: (url: URL) => Promise<void>, storage?: PosterStorage): Promise<PosterFile> {
   signal?.throwIfAborted();
+  if (!storage) throw new Error('未配置图片存储，禁止将海报保存到本地文件');
   if (url.startsWith('/media/posters/')) {
     const existing = await inspectPoster(url, storage);
     if (!existing) throw new Error('已归档海报不存在或内容无效');
@@ -254,21 +226,9 @@ export async function archivePoster(url: string, referer: string, settings: Sett
   const localPath = `/media/posters/${filename}`;
   const existing = await inspectPoster(localPath, storage);
   if (existing?.sha256 === sha256) return existing;
-  if (storage) {
-    const downloadedAt = new Date().toISOString();
-    await storage.put({ path: localPath, sha256, mime, data: bytes, downloadedAt });
-    return { path: localPath, sha256, mime, bytes: bytes.length, downloadedAt };
-  }
-  const folder = posterDirectory();
-  await mkdir(folder, { recursive: true });
-  const temporary = path.join(folder, `.${randomUUID()}.tmp`);
-  try {
-    await writeFile(temporary, bytes, { flag: 'wx' });
-    downloadSignal.throwIfAborted();
-    await rename(temporary, path.join(folder, filename));
-  } finally { await unlink(temporary).catch(() => {}); }
-  const info = await stat(path.join(folder, filename));
-  return { path: localPath, sha256, mime, bytes: bytes.length, downloadedAt: info.mtime.toISOString() };
+  const downloadedAt = new Date().toISOString();
+  await storage.put({ path: localPath, sha256, mime, data: bytes, downloadedAt });
+  return { path: localPath, sha256, mime, bytes: bytes.length, downloadedAt };
 }
 
 /** Compatibility wrapper: failures reject so callers can never expose remote fallback URLs. */
