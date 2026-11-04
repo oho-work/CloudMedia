@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Typecheck, test and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  docker:
+    name: Docker build and isolated smoke check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DATABASE_URL: postgresql://ci:ci@postgres:5432/cloudmedia
+      APP_AUTH_TOKEN: ci-smoke-token
+      POSTGRES_PASSWORD: ci-placeholder-password
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Validate both Compose configurations
+        run: |
+          docker compose -f compose.yaml config --quiet
+          docker compose -f compose.yaml -f compose.postgres.yaml config --quiet
+      - name: Build production image
+        run: docker build --tag cloudmedia:ci .
+      - name: Check compiled service without upstream or database access
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --detach --name cloudmedia-ci --network none \
+            --env DATABASE_URL= --env APP_AUTH_TOKEN=ci-smoke-token \
+            --mount type=volume,source=cloudmedia-ci-data,target=/app/data \
+            cloudmedia:ci
+          test "$(docker exec cloudmedia-ci id -u)" = 1000
+          ready=false
+          for attempt in $(seq 1 30); do
+            if docker exec cloudmedia-ci node -e "fetch('http://127.0.0.1:3001/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          test "$ready" = true
+          docker exec -i cloudmedia-ci node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFile } from 'node:fs/promises';
+          const origin = 'http://127.0.0.1:3001';
+          const health = await (await fetch(`${origin}/api/health`)).json();
+          assert.deepEqual(health, { ok: true, storage: 'file', authRequired: true });
+          assert.equal((await fetch(`${origin}/api/sources`)).status, 401);
+          const response = await fetch(`${origin}/api/sources`, { headers: { authorization: 'Bearer ci-smoke-token' } });
+          assert.equal(response.status, 200);
+          assert.equal((await response.json()).length, 2);
+          const page = await fetch(origin);
+          assert.equal(page.status, 200);
+          assert.match(await page.text(), /<div id="root"><\/div>/);
+          const catalog = JSON.parse(await readFile('/app/data/cloudmedia.json', 'utf8'));
+          assert.equal(catalog.movies.length, 0);
+          assert.equal(catalog.resources.length, 0);
+          console.log('Image serves the built UI and authenticated API, runs as node, and writes its data volume.');
+          NODE
+      - name: Container logs
+        if: always()
+        run: docker logs cloudmedia-ci 2>/dev/null || true
+      - name: Clean up smoke container and volume
+        if: always()
+        run: |
+          docker rm --force cloudmedia-ci 2>/dev/null || true
+          docker volume rm cloudmedia-ci-data 2>/dev/null || true

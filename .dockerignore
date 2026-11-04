@@ -1,0 +1,22 @@
+# Only source/build inputs enter the build context; credentials and archives stay out.
+**
+!Dockerfile
+!.dockerignore
+!package.json
+!package-lock.json
+!tsconfig.json
+!vite.config.ts
+!index.html
+!server/
+!server/**
+!shared/
+!shared/**
+!web/
+!web/**
+!tests/
+!tests/**
+# Keep accidental nested secrets and generated output excluded as well.
+**/.env
+**/.env.*
+**/node_modules/
+**/*.log
