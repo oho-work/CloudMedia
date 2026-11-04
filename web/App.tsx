@@ -241,7 +241,7 @@ function SourceModal({ source, onClose, onSaved }: { source: Source | 'new'; onC
   const [form, setForm] = useState<Partial<Source>>(() => source === 'new' ? {
     name: '', baseUrl: '', adapter: 'html', enabled: true, collectionMode: 'all', updatesSortedDescending: false,
     listPath: '/', detailLinkSelector: 'a[href*="/voddetail/"]', titleSelector: 'h1', posterSelector: '.module-item-pic img, .vodlist_thumb img',
-    descriptionSelector: '.module-info-introduction, .vod_content', resourceSelector: 'a[href*="/vodplay/"], a[href$=".m3u8"]',
+    descriptionSelector: '.module-info-introduction, .vod_content', resourceSelector: 'a[href*="/vodplay/"], a[href$=".m3u8"], a[href*=".m3u8?"], a[href*=".m3u8#"]',
     nextPageSelector: 'a[title="下一页"]', requestIntervalMs: 2500, concurrency: 1,
   } : { ...source, collectionMode: collectionMode(source), concurrency: source.concurrency ?? 1 });
   const [saving, setSaving] = useState(false); const [error, setError] = useState('');

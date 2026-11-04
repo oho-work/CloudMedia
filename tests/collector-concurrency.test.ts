@@ -261,9 +261,10 @@ test('a failed checkpoint stops new HTTP work while draining slow final storage 
 test('date early-stop uses listing order when an older concurrent detail finishes first', { timeout: 5000 }, async () => {
   const f = await fixture((path, _request, response) => {
     if (path === '/list') return void response.end(detailLinks(4) + '<a title="下一页" href="/later">next</a>');
+    if (path.startsWith('/vodplay/')) return void response.end('<video src="https://cdn.example/dated.m3u8"></video>');
     const id = Number(path.split('/').at(-1));
     const date = id === 1 ? '2026-11-04' : id === 2 ? '2026-11-03' : '2026-11-01';
-    setTimeout(() => response.end(`<h1>Movie ${id}</h1><div class="module-info-item"><span class="module-info-item-title">更新：</span><div class="module-info-item-content">${date}</div></div>`), id === 1 ? 60 : id === 2 ? 30 : 0);
+    setTimeout(() => response.end(`<h1>Movie ${id}</h1><div class="module-info-item"><span class="module-info-item-title">更新：</span><div class="module-info-item-content">${date}</div></div>` + episodeLinks(String(id), 1)), id === 1 ? 60 : id === 2 ? 30 : 0);
   });
   try {
     const movies = await collect({ ...f.source(3), updatesSortedDescending: true }, context({ dateRange: { startDate: '2026-11-03', endDate: '2026-11-04', timezone: 'Asia/Shanghai' } }));

@@ -68,6 +68,8 @@ const server = createServer((request, response) => {
   if (url.pathname === '/missing-list') return response.end(links('missing'));
   if (url.pathname === '/unsorted-list') return response.end(links('older', 'c'));
   if (url.pathname === '/instant-list') return response.end(links('instant'));
+  if (url.pathname === '/interrupted-1') return response.end(links('a') + next('/interrupted-2'));
+  if (url.pathname === '/interrupted-2') { response.writeHead(403); return response.end('Denied'); }
   if (url.pathname.startsWith('/voddetail/')) {
     const id = url.pathname.split('/').at(-1)!;
     const update = dates[id] ? `<div class="module-info-item"><span class="module-info-item-title">更新：</span><div class="module-info-item-content">${dates[id]}</div></div>` : '';
@@ -97,25 +99,37 @@ async function collect(source: Source, context = fixtureContext()) {
   return result;
 }
 
-test('range collection includes both boundaries, bypasses all quantity caps, and archives every matching title before playback', { timeout: 15000 }, async () => {
+test('range collection includes both boundaries and checkpoints resources before advancing to later metadata', { timeout: 15000 }, async () => {
   events.length = 0;
   const movies = await collect(fixtureSource(), fixtureContext({ onCheckpoint: async movie => { events.push(`checkpoint:${movie.externalId}:${movie.resources.length}`); } }));
   assert.deepEqual(movies.map(movie => movie.externalId), ['/voddetail/a', '/voddetail/b', '/voddetail/c']);
   assert.deepEqual(movies.map(movie => movie.sourceUpdatedOn), ['2026-11-04', '2026-11-03', '2026-11-02']);
   assert.equal(movies[0].title, movies[1].title, 'same titles on distinct source detail pages must remain distinct collected records');
   assert.ok(movies.every(movie => movie.resources.length === 2), 'all playback pages must be read despite a configured per-movie cap of one');
-  const firstPlay = events.findIndex(event => event.startsWith('request:/vodplay/'));
-  assert.ok(firstPlay > 0);
-  for (const id of ['a', 'b', 'c']) assert.ok(events.indexOf(`checkpoint:/voddetail/${id}:0`) < firstPlay, `metadata for ${id} must be checkpointed before any playback request`);
+  for (const id of ['a', 'b', 'c']) {
+    const firstPlay = events.findIndex(event => event.startsWith(`request:/vodplay/${id}-`));
+    assert.ok(firstPlay > events.indexOf(`checkpoint:/voddetail/${id}:0`), `metadata for ${id} must be saved before its playback requests`);
+  }
+  assert.ok(events.indexOf('checkpoint:/voddetail/a:2') < events.indexOf('request:/voddetail/b'), 'each bounded batch must save resources before reading later detail batches');
+  assert.ok(events.indexOf('checkpoint:/voddetail/b:2') < events.indexOf('request:/range-2'), 'pagination must not defer playback until all metadata has been scanned');
   assert.equal(events.filter(event => event === 'request:/voddetail/a').length, 1, 'repeated and hash-only links must not refetch the same detail page');
   assert.ok(events.includes('request:/range-2'), 'a configured list-page cap of one must not truncate a date range');
   assert.ok(!events.includes('request:/range-3'), 'a descending list can stop at a record older than the inclusive start date');
   assert.ok(!events.some(event => /^request:\/vodplay\/(newer|older)-/.test(event)), 'out-of-range films must not fetch playback pages');
 });
 
+test('a later listing failure preserves resources collected from earlier date batches', { timeout: 5000 }, async () => {
+  const snapshots: CollectedMovie[] = [];
+  await assert.rejects(() => collect(fixtureSource({ listPath: '/interrupted-1', requestIntervalMs: 0 }), fixtureContext({
+    onCheckpoint: async movie => { snapshots.push(structuredClone(movie)); },
+  })), /HTTP 403/);
+  assert.equal(snapshots.at(-1)?.externalId, '/voddetail/a');
+  assert.equal(snapshots.at(-1)?.resources.length, 2, 'saved metadata must already contain playback resources when a later page fails');
+});
+
 test('duplicate-only intermediate pages do not hide later titles', { timeout: 8000 }, async () => {
   events.length = 0;
-  const movies = await collect(fixtureSource({ listPath: '/duplicate-1', resourceSelector: 'a.never' }));
+  const movies = await collect(fixtureSource({ listPath: '/duplicate-1', requestIntervalMs: 0 }));
   assert.deepEqual(movies.map(movie => movie.externalId), ['/voddetail/a', '/voddetail/b']);
   for (const page of ['/duplicate-1', '/duplicate-2', '/duplicate-3']) assert.equal(events.filter(event => event === `request:${page}`).length, 1);
   assert.equal(events.filter(event => event === 'request:/voddetail/a').length, 1);
@@ -123,14 +137,15 @@ test('duplicate-only intermediate pages do not hide later titles', { timeout: 80
 
 test('list cycles report incomplete collection without refetching pages or losing discovered metadata', { timeout: 5000 }, async () => {
   events.length = 0;
-  const checkpoints: string[] = [];
-  await assert.rejects(() => collect(fixtureSource({ listPath: '/cycle-1', resourceSelector: 'a.never' }), fixtureContext({ onCheckpoint: async movie => { checkpoints.push(movie.externalId); } })), /分页形成循环/);
-  assert.deepEqual(checkpoints, ['/voddetail/a', '/voddetail/b']);
+  const checkpoints = new Map<string, CollectedMovie>();
+  await assert.rejects(() => collect(fixtureSource({ listPath: '/cycle-1', requestIntervalMs: 0 }), fixtureContext({ onCheckpoint: async movie => { checkpoints.set(movie.externalId, structuredClone(movie)); } })), /分页形成循环/);
+  assert.deepEqual([...checkpoints.keys()], ['/voddetail/a', '/voddetail/b']);
+  assert.ok([...checkpoints.values()].every(movie => movie.resources.length === 2), 'a pagination cycle must preserve already collected playback resources');
   for (const page of ['/cycle-1', '/cycle-2']) assert.equal(events.filter(event => event === `request:${page}`).length, 1);
 });
 
 test('an unsorted update source continues after older records instead of assuming descending order', { timeout: 5000 }, async () => {
-  const movies = await collect(fixtureSource({ listPath: '/unsorted-list', updatesSortedDescending: false, resourceSelector: 'a.never' }));
+  const movies = await collect(fixtureSource({ listPath: '/unsorted-list', updatesSortedDescending: false, requestIntervalMs: 0 }));
   assert.deepEqual(movies.map(movie => movie.externalId), ['/voddetail/c']);
 });
 
@@ -143,7 +158,7 @@ test('missing source update dates fail the date filter without collecting an und
 });
 
 test('a frozen range timezone controls timestamp classification when current settings use a different timezone', { timeout: 5000 }, async () => {
-  const movies = await collect(fixtureSource({ listPath: '/instant-list', resourceSelector: 'a.never' }), fixtureContext({ settings: { ...defaultSettings, timezone: 'UTC', maxRetries: 0 }, dateRange: { startDate: '2026-11-03', endDate: '2026-11-03', timezone: 'Asia/Shanghai' } }));
+  const movies = await collect(fixtureSource({ listPath: '/instant-list', requestIntervalMs: 0 }), fixtureContext({ settings: { ...defaultSettings, timezone: 'UTC', maxRetries: 0 }, dateRange: { startDate: '2026-11-03', endDate: '2026-11-03', timezone: 'Asia/Shanghai' } }));
   assert.equal(movies.length, 1);
   assert.equal(movies[0].sourceUpdatedOn, '2026-11-03');
 });

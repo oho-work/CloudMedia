@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { ProbeResult, Settings, Source, State } from '../shared/types.js';
+const defaultResourceSelector = 'a[href*="/vodplay/"], a[href$=".m3u8"], a[href*=".m3u8?"], a[href*=".m3u8#"]';
 export const defaultSettings: Settings = {
   dailyTime: '03:00', timezone: 'Asia/Shanghai', schedulerEnabled: true,
   probeEnabled: true, sampleSegments: 1, sampleBytes: 262144,
@@ -13,13 +14,14 @@ export const emptyProbe = (): ProbeResult => ({ status: 'pending', checkedAt: nu
 export function sourceDefaults(input: Partial<Source> = {}): Source {
   const normalized = { ...input } as Partial<Source> & Record<string, unknown>;
   delete normalized.jsonItemsPath; delete normalized.jsonTitleField; delete normalized.jsonUrlField;
+  if (normalized.resourceSelector === 'a[href*="/vodplay/"], a[href$=".m3u8"]') normalized.resourceSelector = defaultResourceSelector;
   // Recognize the bundled update feed on load as well as on first setup, so an
   // existing installation gains today's scope without changing its source ID.
   const bundledUpdates = /^555\s*影视$/.test(input.name || '') && input.listPath === '/label/new.html';
   return { id: randomUUID(), name: '', baseUrl: '', enabled: true,
     listPath: '/', detailLinkSelector: 'a[href*="/voddetail/"]', titleSelector: 'h1',
     posterSelector: '.module-item-pic img, .vodlist_thumb img', descriptionSelector: '.module-info-introduction, .vod_content',
-    resourceSelector: 'a[href*="/vodplay/"], a[href$=".m3u8"]', nextPageSelector: 'a[title="下一页"]',
+    resourceSelector: defaultResourceSelector, nextPageSelector: 'a[title="下一页"]',
     requestIntervalMs: 2500, concurrency: 1,
     createdAt: new Date().toISOString(), lastRunAt: null, lastError: null,
     updatesSortedDescending: bundledUpdates,

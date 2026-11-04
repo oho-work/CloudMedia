@@ -28,7 +28,7 @@ const server = createServer((request, response) => {
     if (id === 'refresh') { response.end('<h1>Refresh movie</h1><a href="/vodplay/refresh">正片</a>'); return; }
     if (id?.startsWith('dated-')) {
       const date = id === 'dated-today' ? resolveDateRange({}, defaultSettings.timezone).startDate : '2000-01-01';
-      response.end(`<h1>${id}</h1><div class="module-info-item"><span class="module-info-item-title">更新：</span><div class="module-info-item-content">${date}</div></div>`); return;
+      response.end(`<h1>${id}</h1><div class="module-info-item"><span class="module-info-item-title">更新：</span><div class="module-info-item-content">${date}</div></div><a href="/vodplay/${id}">正片</a>`); return;
     }
     response.end(`<h1>Movie ${id}</h1><a href="/vodplay/${id}-1">第1集</a><a href="/vodplay/${id}-2">第2集</a>`); return;
   }

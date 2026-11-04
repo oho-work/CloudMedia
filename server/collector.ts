@@ -44,6 +44,10 @@ export function extractPlayerUrls(html: string, base: string, includeAnchors = t
   return [...found];
 }
 
+function playbackResponseUrls(content: { body: string; url: string }): string[] {
+  return content.body.trimStart().startsWith('#EXTM3U') ? [content.url] : extractPlayerUrls(content.body, content.url);
+}
+
 class SourceClient {
   private lastRequest = 0;
   private requestStart: Promise<void> = Promise.resolve();
@@ -130,7 +134,7 @@ export async function resolvePlaybackPage(source: Source, pageUrl: string, conte
   const target = absolute(pageUrl, source.baseUrl);
   if (!target || new URL(target).origin !== new URL(source.baseUrl).origin) throw new Error('播放页必须位于当前采集源域名下');
   const content = await new SourceClient(source, context).get(target, referer);
-  const urls = content.body.trimStart().startsWith('#EXTM3U') ? [content.url] : extractPlayerUrls(content.body, content.url);
+  const urls = playbackResponseUrls(content);
   if (!urls.length) throw new Error('播放页未发现公开 m3u8 地址；可能已失效或需要更新采集规则');
   const resolvedAt = new Date().toISOString();
   return urls.map(url => ({ name: source.name, episode: '正片', url, referer: content.url, pageUrl: content.url, resolvedAt }));
@@ -303,7 +307,7 @@ async function populateHtmlResources(plan: HtmlPlan, client: SourceClient, conte
         if (result.status === 'rejected') continue;
         const play = pages[index]; const content = result.value;
         if (content) {
-          const urls = extractPlayerUrls(content.body, content.url);
+          const urls = playbackResponseUrls(content);
           if (!urls.length) {
             const message = `「${movie.title}」${play.name} / ${play.episode} 未发现公开 m3u8，保留影片资料及已有资源`;
             context.log(message); context.onCollectionError?.(message);
@@ -322,7 +326,12 @@ async function populateHtmlResources(plan: HtmlPlan, client: SourceClient, conte
     }
   } finally { await checkpoint(); }
   movie.resources = [...resources.values()];
-  if (!movie.resources.length) context.log(`「${movie.title}」未发现公开 m3u8 地址，已保留影片资料`);
+  if (!movie.resources.length) {
+    if (!playPages.size) {
+      const message = `「${movie.title}」未匹配到播放链接，请检查播放链接 CSS 选择器或源站页面；已保留影片资料`;
+      context.log(message); context.onCollectionError?.(message);
+    } else context.log(`「${movie.title}」未发现公开 m3u8 地址，已保留影片资料`);
+  }
   return movie;
 }
 
@@ -368,7 +377,6 @@ async function* collectSourcePages(source: Source, context: CollectionContext, a
   let pageUrl = absolute(source.listPath || '/', source.baseUrl);
   if (!pageUrl) throw new Error('源站列表地址无效');
   let count = 0;
-  const updatePlans: HtmlPlan[] = [];
   let reachedStart = false;
   const visited = new Set<string>();
   const visitedPages = new Set<string>();
@@ -441,15 +449,17 @@ async function* collectSourcePages(source: Source, context: CollectionContext, a
         visitedMovies.add(movie.externalId);
         const plan = htmlPlan(movie, detail, source);
         if (dateRange) {
-          // Archive every matching title before long episode/line resolution.
+          // Save this bounded batch before resolving it; never defer playback
+          // until the entire date range has been scanned.
           await context.onCheckpoint?.(structuredClone(movie));
-          updatePlans.push(plan); count++;
-          context.log(`已发现 ${count} 部日期范围内影片，正在读取影片资料`);
-        } else plans.push(plan);
+          count++;
+          context.log(`已发现 ${count} 部日期范围内影片，正在补齐播放资源`);
+        }
+        plans.push(plan);
       }
       if (plans.length) {
         const movies = await client.batch(plans, plan => populateHtmlResources(plan, client, context));
-        count += movies.length;
+        if (!dateRange) count += movies.length;
         for (const movie of movies) { context.signal?.throwIfAborted(); yield movie; }
       }
     }
@@ -457,14 +467,6 @@ async function* collectSourcePages(source: Source, context: CollectionContext, a
     const nextHref = source.nextPageSelector ? $(source.nextPageSelector).first().attr('href') : undefined;
     const next = nextHref ? absolute(nextHref, response.url) : '';
     pageUrl = next && new URL(next).origin === new URL(response.url).origin && next !== pageUrl ? next : '';
-  }
-  for (let offset = 0; offset < updatePlans.length; offset += client.limit) {
-    context.signal?.throwIfAborted();
-    const movies = await client.batch(updatePlans.slice(offset, offset + client.limit), (plan, index) => {
-      context.log(`已归档 ${updatePlans.length} 部影片资料，补齐第 ${offset + index + 1}/${updatePlans.length} 部播放资源`);
-      return populateHtmlResources(plan, client, context);
-    });
-    for (const movie of movies) { context.signal?.throwIfAborted(); yield movie; }
   }
   context.log(`本次读取 ${count} 部影片`);
   if (dateRange && incompletePages) throw new Error(`已读取 ${count} 部影片；${incompletePages} 个页面未完整取得内容，详见任务错误，可重新采集补齐`);
