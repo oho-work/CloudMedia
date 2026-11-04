@@ -47,11 +47,23 @@ export interface Movie {
   sourceRefs: { sourceId: string; externalId: string; pageUrl: string; updatedOn?: string }[];
   createdAt: string; updatedAt: string;
 }
+export interface CollectionProgress {
+  discoveredMovies: number; completedMovies: number; activeMovies: number;
+  concurrency: number; currentPage: number; paginationComplete: boolean;
+  activeMovieTitles: string[];
+}
+export interface RunProgress extends CollectionProgress {
+  /** Live queue/permit counts and actual measurement outcomes for this run only. */
+  probes: { queued: number; active: number; passed: number; failed: number };
+  failures: { collection: number; probe: number; poster: number; runtime: number; total: number };
+}
 export interface Run {
   id: string; sourceId: string; sourceName: string; status: 'queued' | 'running' | 'success' | 'error' | 'interrupted';
   startedAt: string; finishedAt: string | null; scanned: number; added: number; updated: number;
   resourceCount: number; errors: string[]; message: string;
   dateRange?: DateRange;
+  /** Absent on legacy runs; unknown totals must never be inferred from scanned. */
+  progress?: RunProgress;
 }
 export interface State { sources: Source[]; movies: Movie[]; resources: Resource[]; runs: Run[]; settings: Settings }
 export interface CollectedResource { name: string; episode: string; url: string; referer?: string; pageUrl?: string; resolvedAt?: string }
@@ -73,6 +85,7 @@ export interface CollectionContext {
   onCheckpoint?: (movie: CollectedMovie) => Promise<void>;
   /** Await the complete movie pipeline before releasing its collection slot. */
   onMovie?: (movie: CollectedMovie) => Promise<void>;
+  onProgress?: (progress: CollectionProgress) => void;
 }
 export interface Dashboard {
   movieCount: number; resourceCount: number; sourceCount: number; enabledSourceCount: number;

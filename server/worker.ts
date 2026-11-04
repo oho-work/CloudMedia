@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import type { CollectedMovie, CollectionRequest, DateRange, Resource, Run, Source } from '../shared/types.js';
-import { collectSource, resolvePlaybackPage } from './collector.js';
+import type { CollectedMovie, CollectionRequest, DateRange, Resource, Run, RunProgress, Source } from '../shared/types.js';
+import { collectSource, IncompleteCollectionError, resolvePlaybackPage } from './collector.js';
 import { rememberResource, upsertMovie } from './catalog.js';
 import { probeResource } from './hls.js';
 import { localMinute } from './scheduler.js';
@@ -31,6 +31,23 @@ function collectionRange(source: Source, request: CollectionRequest, timezone: s
 
 function sameRange(left?: DateRange, right?: DateRange) {
   return left?.startDate === right?.startDate && left?.endDate === right?.endDate && left?.timezone === right?.timezone;
+}
+function initialProgress(concurrency: number): RunProgress {
+  return { discoveredMovies: 0, completedMovies: 0, activeMovies: 0,
+    concurrency: Math.max(1, Math.min(20, Math.floor(concurrency || 1))), currentPage: 0, paginationComplete: false,
+    activeMovieTitles: [], probes: { queued: 0, active: 0, passed: 0, failed: 0 },
+    failures: { collection: 0, probe: 0, poster: 0, runtime: 0, total: 0 } };
+}
+function finishProgress(run: Run) {
+  if (!run.progress) return;
+  run.progress.activeMovies = 0; run.progress.activeMovieTitles = [];
+  run.progress.probes.queued = run.progress.probes.active = 0;
+}
+function recordFailure(run: Run, phase: Exclude<keyof RunProgress['failures'], 'total'>, message: string) {
+  if (run.progress) { run.progress.failures[phase]++; run.progress.failures.total++; }
+  // Keep recent actionable samples bounded independently of the complete count.
+  if (run.errors.length >= 30) run.errors.shift();
+  run.errors.push(message.replace(/https?:\/\/\S+/g, '[地址已隐藏]').slice(0, 1000));
 }
 
 export class Worker {
@@ -77,7 +94,7 @@ export class Worker {
       if (!sameRange(existing.dateRange, dateRange)) throw new WorkerRequestError('该源已有其他采集范围的任务，请等待完成或取消后重试', 409);
       return existing;
     }
-    const run: Run = { id: randomUUID(), sourceId: source.id, sourceName: source.name, status: 'queued', startedAt: instant.toISOString(), finishedAt: null, scanned: 0, added: 0, updated: 0, resourceCount: 0, errors: [], message: '等待采集', ...(dateRange ? { dateRange } : {}) };
+    const run: Run = { id: randomUUID(), sourceId: source.id, sourceName: source.name, status: 'queued', startedAt: instant.toISOString(), finishedAt: null, scanned: 0, added: 0, updated: 0, resourceCount: 0, errors: [], message: '等待采集', progress: initialProgress(source.concurrency), ...(dateRange ? { dateRange } : {}) };
     this.store.state.runs.unshift(run);
     const snapshot = structuredClone(source);
     this.frozenSourceLimits.set(source.id, snapshot.concurrency || 1);
@@ -97,6 +114,7 @@ export class Worker {
     if (run.status === 'queued') {
       this.queue = this.queue.filter(item => item.run.id !== id);
       run.status = 'interrupted'; run.finishedAt = new Date().toISOString(); run.message = '用户取消，已保存的采集结果保留';
+      finishProgress(run);
       this.runControllers.delete(id);
       this.releaseSourceLimit(run.sourceId);
     } else run.message = '正在取消采集，已保存的结果保留';
@@ -115,6 +133,22 @@ export class Worker {
         const cancellation = AbortSignal.any([this.controller.signal, runController.signal]);
         const processingController = new AbortController();
         const signal = AbortSignal.any([cancellation, processingController.signal]);
+        const progress = run.progress ||= initialProgress(source.concurrency);
+        let progressTimer: ReturnType<typeof setTimeout> | undefined;
+        let progressWrite = Promise.resolve();
+        let progressWriteFailure: unknown;
+        let recordedFailure: unknown;
+        let collectionFailed = false;
+        const progressChanged = () => {
+          if (progressTimer || signal.aborted) return;
+          progressTimer = setTimeout(() => {
+            progressTimer = undefined;
+            progressWrite = progressWrite.then(() => this.store.save()).catch(error => {
+              progressWriteFailure = error; processingController.abort(error);
+            });
+          }, 250);
+          progressTimer.unref();
+        };
         run.status = 'running'; run.message = '正在读取源页面';
         try {
           await this.store.save();
@@ -148,14 +182,25 @@ export class Worker {
               const identity = `${resource.id}:${resource.url}:${resource.resolvedAt || ''}`;
               if (queue.jobs.has(identity)) continue;
               const originalUrl = resource.url, resolvedAt = resource.resolvedAt;
+              let started = false;
+              progress.probes.queued++; progressChanged();
               const task = queue.limiter.run(async () => {
                 signal.throwIfAborted();
                 if (resource.url !== originalUrl || resource.resolvedAt !== resolvedAt || resource.probe.status !== 'pending') return;
                 run.message = `正在检测「${input.title}」${resource.name} / ${resource.episode}`;
-                const checked = await this.probe(resource, false, signal);
+                const checked = await this.probe(resource, false, signal, () => {
+                  started = true; progress.probes.queued--; progress.probes.active++; progressChanged();
+                });
                 signal.throwIfAborted();
-                if (checked.probe.status === 'error' && run.errors.length < 30) run.errors.push(`${resource.episode}：${checked.probe.error}`);
-              }, signal).catch(error => { processingController.abort(error); throw error; });
+                if (checked.probe.status === 'ok') progress.probes.passed++;
+                else if (checked.probe.status === 'error') {
+                  progress.probes.failed++;
+                  recordFailure(run, 'probe', `${input.title} / ${resource.episode}：${checked.probe.error}`);
+                }
+              }, signal).catch(error => { processingController.abort(error); throw error; }).finally(() => {
+                if (started) progress.probes.active--; else progress.probes.queued--;
+                progressChanged();
+              });
               queue.jobs.set(identity, task); activeProbes.add(task);
               const pendingQueue = queue;
               const release = () => {
@@ -166,14 +211,17 @@ export class Worker {
             }
           };
           const checkpoint = async (input: CollectedMovie) => {
-            const result = await persist(input);
-            scheduleProbes(input, result.resources);
-            return result;
+            try {
+              const result = await persist(input);
+              scheduleProbes(input, result.resources);
+              return result;
+            } catch (error) { processingController.abort(error); throw error; }
           };
           const processMovie = async (input: CollectedMovie) => {
             try {
               signal.throwIfAborted();
               const result = await checkpoint(input);
+              const previousPosterAttempts = result.movie.posterArchive?.attempts || 0;
               // Incremental probes already run while playback pages are being
               // resolved. A movie keeps its slot until both tasks finish.
               const results = await Promise.allSettled([
@@ -183,6 +231,10 @@ export class Worker {
               const rejected = results.find(result => result.status === 'rejected');
               if (rejected?.status === 'rejected') throw rejected.reason;
               signal.throwIfAborted();
+              if (result.movie.posterArchive?.status === 'error' && result.movie.posterArchive.attempts > previousPosterAttempts) {
+                recordFailure(run, 'poster', `${input.title}：${result.movie.posterArchive.error || '海报归档失败'}`);
+                progressChanged();
+              }
             } catch (error) { processingController.abort(error); throw error; }
             finally { movieProbes.delete(input.externalId); }
           };
@@ -190,8 +242,9 @@ export class Worker {
             for await (const _input of collectSource(source, {
               settings, dateRange: run.dateRange, signal,
               runSourceTask: (action, taskSignal) => this.sourceLimiter(source.id).run(action, taskSignal),
-              onCollectionError: message => { collectionErrors++; if (run.errors.length < 30) run.errors.push(message); },
+              onCollectionError: message => { collectionErrors++; recordFailure(run, 'collection', message); progressChanged(); },
               log: message => { if (!signal.aborted) run.message = message; },
+              onProgress: update => { Object.assign(progress, update); progressChanged(); },
               onCheckpoint: async input => { await checkpoint(input); },
               onMovie: processMovie,
               existingResources: externalId => {
@@ -205,6 +258,9 @@ export class Worker {
                 return this.store.state.resources.filter(item => item.movieId === movie?.id && item.sourceId === source.id && item.pageUrl).map(item => item.pageUrl!);
               },
             })) { signal.throwIfAborted(); }
+          } catch (error) {
+            collectionFailed = !processingController.signal.aborted;
+            throw error;
           } finally {
             // Checkpoints can have started probes before the generator yields.
             // Cancellation/failure must drain those jobs before final run save.
@@ -215,9 +271,21 @@ export class Worker {
           run.status = collectionErrors ? 'error' : 'success';
           run.message = `已扫描 ${run.scanned} 部，新增 ${run.added} 部，更新 ${run.updated} 部${collectionErrors ? `；${collectionErrors} 个播放页未取得地址，可重新采集补齐` : ''}`;
         } catch (error) {
+          const failure = processingController.signal.aborted ? processingController.signal.reason : error;
           run.status = cancellation.aborted ? 'interrupted' : 'error';
-          run.message = cancellation.aborted ? (this.stopping ? '服务停止，已保存的采集结果保留' : '用户取消，已保存的采集结果保留') : error instanceof Error ? error.message : '采集失败';
-          if (!cancellation.aborted) run.errors.push(run.message);
+          run.message = cancellation.aborted ? (this.stopping ? '服务停止，已保存的采集结果保留' : '用户取消，已保存的采集结果保留') : failure instanceof Error ? failure.message : '采集失败';
+          if (!cancellation.aborted && !(failure instanceof IncompleteCollectionError)) {
+            recordFailure(run, collectionFailed ? 'collection' : 'runtime', run.message); recordedFailure = failure;
+          }
+        } finally {
+          clearTimeout(progressTimer);
+          await progressWrite;
+          if (progressWriteFailure && progressWriteFailure !== recordedFailure && !cancellation.aborted) {
+            run.status = 'error'; run.message = `任务进度写入失败：${progressWriteFailure instanceof Error ? progressWriteFailure.message : '存储失败'}`;
+            recordFailure(run, 'runtime', run.message);
+          }
+          // No callbacks or background writes survive the terminal run save.
+          finishProgress(run);
         }
         this.runControllers.delete(run.id);
         this.releaseSourceLimit(source.id);
@@ -227,7 +295,7 @@ export class Worker {
         try { await this.store.save(); }
         catch (error) {
           run.status = 'error'; run.message = `任务写入失败：${error instanceof Error ? error.message : '未知错误'}`;
-          run.errors.push(run.message);
+          recordFailure(run, 'runtime', run.message);
           if (current) current.lastError = run.message;
           // A transient final write must persist an error rather than report an unsaved success.
           await this.store.save();
@@ -238,7 +306,7 @@ export class Worker {
       const message = `存储写入失败，排队任务已中断：${error instanceof Error ? error.message : '未知错误'}`;
       console.error(message);
       for (const { run } of this.queue) {
-        run.status = 'interrupted'; run.finishedAt = new Date().toISOString(); run.message = message; run.errors.push(message);
+        run.status = 'interrupted'; run.finishedAt = new Date().toISOString(); run.message = message; recordFailure(run, 'runtime', message); finishProgress(run);
         this.runControllers.delete(run.id);
         this.releaseSourceLimit(run.sourceId);
       }
@@ -263,7 +331,7 @@ export class Worker {
     this.frozenSourceLimits.delete(sourceId);
     this.sourceLimiter(sourceId);
   }
-  probe(resource: Resource, refresh = false, signal = this.controller.signal): Promise<Resource> {
+  probe(resource: Resource, refresh = false, signal = this.controller.signal, onStart?: () => void): Promise<Resource> {
     if (this.stopping) return Promise.reject(new Error('服务正在停止'));
     const key = `${resource.id}:${refresh}:${signal === this.controller.signal ? 'manual' : 'run'}`;
     const pending = this.pendingProbes.get(key);
@@ -276,6 +344,7 @@ export class Worker {
     const task = serial.limiter.run(() => sourceLimiter.run(async () => {
       if (this.stopping) throw new Error('服务正在停止');
       combinedSignal.throwIfAborted();
+      onStart?.();
       if (refresh) {
         const source = this.store.state.sources.find(item => item.id === resource.sourceId);
         if (!source || !resource.pageUrl) throw new Error('该资源没有可用的原始播放页，请重新采集来源');
@@ -349,7 +418,7 @@ export class Worker {
   async stop() {
     this.stopping = true; clearInterval(this.timer); this.controller.abort();
     await this.posters.stop();
-    for (const { run } of this.queue) { run.status = 'interrupted'; run.finishedAt = new Date().toISOString(); run.message = '服务停止，排队任务已中断'; this.runControllers.delete(run.id); this.releaseSourceLimit(run.sourceId); }
+    for (const { run } of this.queue) { run.status = 'interrupted'; run.finishedAt = new Date().toISOString(); run.message = '服务停止，排队任务已中断'; finishProgress(run); this.runControllers.delete(run.id); this.releaseSourceLimit(run.sourceId); }
     this.queue.length = 0;
     while (this.working) await new Promise(resolve => setTimeout(resolve, 100));
     await Promise.allSettled([...this.pendingProbes.values()]);

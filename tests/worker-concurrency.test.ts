@@ -270,6 +270,12 @@ test('cancelled collection drains active probes and retains saved resources with
   assert.equal(f.starts.length, 2, 'queued episode probes never start after cancellation');
   assert.equal(f.durable().resources.length, 4);
   assert.ok(f.durable().resources.every(resource => resource.probe.status === 'pending'));
+  const progress = f.durable().runs.find(item => item.id === run.id)?.progress;
+  assert.equal(progress?.activeMovies, 0);
+  assert.equal(progress?.completedMovies, 0, 'cancelled measurements must not mark a movie completed');
+  assert.deepEqual(progress?.activeMovieTitles, []);
+  assert.deepEqual(progress?.probes, { queued: 0, active: 0, passed: 0, failed: 0 });
+  assert.equal(progress?.failures.total, 0, 'user cancellation is not a failed request');
   f.release();
 });
 

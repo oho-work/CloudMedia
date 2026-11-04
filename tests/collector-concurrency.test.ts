@@ -6,7 +6,7 @@ import { after, before, test } from 'node:test';
 import { collectSource } from '../server/collector.js';
 import { TaskLimiter } from '../server/concurrency.js';
 import { defaultSettings, sourceDefaults } from '../server/defaults.js';
-import type { CollectedMovie, CollectionContext } from '../shared/types.js';
+import type { CollectedMovie, CollectionContext, CollectionProgress } from '../shared/types.js';
 
 let previousPrivate: string | undefined;
 before(() => { previousPrivate = process.env.ALLOW_PRIVATE_UPSTREAM; process.env.ALLOW_PRIVATE_UPSTREAM = 'true'; });
@@ -84,11 +84,16 @@ test('ordered standalone results bound completed buffers and drain work when the
     if (waiting.length === 3) resolveThird();
   });
   const controller = new AbortController();
-  const iterator = collectSource(f.source(2), context({ signal: controller.signal }));
+  const progress: CollectionProgress[] = [];
+  const iterator = collectSource(f.source(2), context({ signal: controller.signal, onProgress: value => { progress.push(value); } }));
   const first = iterator.next();
   try {
     await Promise.race([pair, delay(300).then(() => assert.fail('two detail requests must overlap'))]);
     assert.equal(f.maximum, 2);
+    assert.equal(progress.at(-1)?.currentPage, 1);
+    assert.equal(progress.at(-1)?.paginationComplete, false, 'exhausting the final listing does not fix the total before its details are classified');
+    assert.equal(progress.at(-1)?.discoveredMovies, 0);
+    assert.equal(progress.at(-1)?.activeMovies, 2, 'slots include details before a title has been parsed');
     waiting[1].end('<h1>Second</h1>');
     await delay(15);
     assert.equal(f.requests.length, 3, 'a completed out-of-order movie must still occupy the bounded result buffer');
@@ -99,6 +104,8 @@ test('ordered standalone results bound completed buffers and drain work when the
     await iterator.return(undefined);
     await delay(15);
     assert.equal(f.active, 0, 'return must abort and drain the active replacement request');
+    assert.equal(progress.at(-1)?.activeMovies, 0);
+    assert.deepEqual(progress.at(-1)?.activeMovieTitles, []);
     assert.equal(f.requests.length, 4);
   } finally { controller.abort(); await first.catch(() => {}); await iterator.return(undefined).catch(() => {}); await f.close(); }
 });

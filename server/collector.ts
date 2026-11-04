@@ -110,6 +110,8 @@ class SourceClient {
 }
 class StopError extends Error {}
 class PageError extends Error {}
+/** Its individual failures have already been reported through onCollectionError. */
+export class IncompleteCollectionError extends Error {}
 
 /** Refresh one stored public player page without executing its scripts. */
 export async function resolvePlaybackPage(source: Source, pageUrl: string, context: CollectionContext, referer = source.baseUrl): Promise<CollectedResource[]> {
@@ -368,11 +370,16 @@ async function* collectSourcePages(source: Source, context: CollectionContext, a
   let pageUrl = absolute(source.listPath || '/', source.baseUrl);
   if (!pageUrl) throw new Error('源站列表地址无效');
   let count = 0;
+  let completedMovies = 0; let currentPage = 0; let paginationComplete = false;
+  const activeTitles = new Map<number, string>();
   let reachedStart = false;
   const visited = new Set<string>();
   const visitedPages = new Set<string>();
   const visitedMovies = new Set<string>();
   const active = new Set<Promise<void>>();
+  const reportProgress = () => context.onProgress?.({ discoveredMovies: count, completedMovies,
+    activeMovies: active.size, concurrency: client.limit, currentPage, paginationComplete,
+    activeMovieTitles: [...activeTitles.values()].filter(Boolean).slice(0, client.limit).map(title => title.slice(0, 160)) });
   const completed = new Map<number, CollectedMovie | null>();
   const ready: CollectedMovie[] = [];
   let scheduled = 0; let nextResult = 0; let finished = false;
@@ -414,16 +421,15 @@ async function* collectSourcePages(source: Source, context: CollectionContext, a
         context.signal?.throwIfAborted();
         if (reachedStart) return null;
         if (!detail) {
-          if (dateRange) {
-            const message = `详情页请求失败，已记录后继续采集其他影片：${safeUrlLabel(detailUrl)}（${detailError instanceof Error ? detailError.message : '请求错误'}）`;
-            context.log(message); context.onCollectionError?.(message);
-          } else context.log(`详情页请求失败，已跳过：${safeUrlLabel(detailUrl)}`);
+          const message = `详情页请求失败，已记录后继续采集其他影片：${safeUrlLabel(detailUrl)}（${detailError instanceof Error ? detailError.message : '请求错误'}）`;
+          context.log(message); context.onCollectionError?.(message);
           return null;
         }
         const movie = parseHtmlMovie(detail.body, source, detail.url, dateRange?.timezone ?? context.settings.timezone);
         if (!movie) {
           if (dateRange) throw new Error(`详情页没有匹配片名，无法完成日期范围采集：${safeUrlLabel(detailUrl)}`);
-          context.log('详情页没有匹配片名，已跳过'); return null;
+          const message = `详情页没有匹配片名，已跳过：${safeUrlLabel(detailUrl)}`;
+          context.log(message); context.onCollectionError?.(message); return null;
         }
         if (dateRange) {
           const updatedOn = movie.sourceUpdatedOn;
@@ -438,19 +444,23 @@ async function* collectSourcePages(source: Source, context: CollectionContext, a
         visitedMovies.add(movie.externalId);
         plan = htmlPlan(movie, detail, source);
         count++;
+        activeTitles.set(sequence, movie.title);
+        reportProgress();
         if (dateRange) context.log(`已发现 ${count} 部日期范围内影片，正在补齐播放资源`);
       } finally { releaseDecision(); }
       const movie = await populateHtmlResources(plan, client, context);
       await context.onMovie?.(movie);
       context.signal?.throwIfAborted();
+      completedMovies++;
       return movie;
     })().then(movie => {
       if (context.onMovie) { if (movie) ready.push(movie); }
       else completed.set(sequence, movie);
     }, error => {
       releaseDecision(); if (!context.onMovie) completed.set(sequence, null); stop(error);
-    }).finally(() => { active.delete(task); wake(); });
+    }).finally(() => { active.delete(task); activeTitles.delete(sequence); reportProgress(); wake(); });
     active.add(task);
+    reportProgress();
   };
   const produce = async () => {
     for (let page = 1; pageUrl && !reachedStart; page++) {
@@ -462,6 +472,7 @@ async function* collectSourcePages(source: Source, context: CollectionContext, a
         context.log('列表分页地址重复，已停止翻页'); break;
       }
       visitedPages.add(key);
+      currentPage = page; reportProgress();
       context.log(`读取页面第 ${page} 页`);
       const response = await client.get(pageUrl, listingReferer); const $ = load(response.body);
       listingReferer = response.url;
@@ -497,6 +508,11 @@ async function* collectSourcePages(source: Source, context: CollectionContext, a
       const next = nextHref ? absolute(nextHref, response.url) : '';
       pageUrl = next && new URL(next).origin === new URL(response.url).origin && next !== pageUrl ? next : '';
     }
+    // Listing exhaustion alone does not make the accepted movie count final:
+    // the last page's details may still be awaiting their ordered decisions.
+    await decisions;
+    context.signal?.throwIfAborted();
+    paginationComplete = true; reportProgress();
   };
   const producer = produce().catch(error => {
     if (error instanceof StopError || context.signal?.aborted) stop(error);
@@ -531,5 +547,5 @@ async function* collectSourcePages(source: Source, context: CollectionContext, a
     context.signal?.removeEventListener('abort', wake);
   }
   context.log(`本次读取 ${count} 部影片`);
-  if (dateRange && incompletePages) throw new Error(`已读取 ${count} 部影片；${incompletePages} 个页面未完整取得内容，详见任务错误，可重新采集补齐`);
+  if (dateRange && incompletePages) throw new IncompleteCollectionError(`已读取 ${count} 部影片；${incompletePages} 个页面未完整取得内容，详见任务错误，可重新采集补齐`);
 }
