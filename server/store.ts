@@ -6,6 +6,12 @@ import { initialState, sourceDefaults } from './defaults.js';
 
 type Table = 'sources' | 'movies' | 'resources' | 'runs';
 const tables: Table[] = ['sources', 'movies', 'resources', 'runs'];
+function canonicalJson(value: unknown): string {
+  return JSON.stringify(value, (_key, item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return item;
+    return Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]]));
+  });
+}
 export class Store {
   state: State = initialState();
   readonly mode: 'postgres' | 'file';
@@ -53,6 +59,8 @@ export class Store {
           this.state.settings = { ...this.state.settings, ...settings.rows[0].data };
           for (const table of tables) {
             const rows = await client.query(`SELECT data FROM "${this.schema}".${table}`);
+            // Compare saves to the stored rows before startup defaults or run recovery change them.
+            for (const row of rows.rows) this.persisted.set(`${table}:${row.data.id}`, canonicalJson(row.data));
             (this.state[table] as unknown[]) = rows.rows.map(row => row.data);
           }
         }
@@ -90,7 +98,7 @@ export class Store {
         for (const table of tables) {
           const values = state[table];
           for (const value of values) {
-            const json = JSON.stringify(value); const key = `${table}:${value.id}`; next.set(key, json);
+            const json = canonicalJson(value); const key = `${table}:${value.id}`; next.set(key, json);
             if (this.persisted.get(key) === json) continue;
             await client.query(`INSERT INTO "${this.schema}".${table} (id,data) VALUES ($1,$2::jsonb) ON CONFLICT(id) DO UPDATE SET data=EXCLUDED.data`, [value.id, json]);
           }

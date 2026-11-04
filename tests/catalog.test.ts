@@ -13,6 +13,17 @@ test('repeat collection updates expiring URLs and preserves movie/resource ident
   assert.equal(second.added, false); assert.equal(state.movies.length, 1); assert.equal(state.resources.length, 1);
   assert.equal(second.movie.id, first.movie.id); assert.equal(second.resources[0].probe.status, 'pending');
 });
+
+test('replacing a resource retains its previously archived URL and measured probe', () => {
+  const state = initialState(); const source = sourceDefaults({ baseUrl: 'https://example.com' });
+  const input = { externalId: 'history', pageUrl: 'https://example.com/detail/1', title: '历史', resources: [{ name: '线路', episode: '正片', url: 'https://cdn.example.com/old.m3u8', resolvedAt: '2026-11-01T00:00:00Z' }] };
+  const resource = upsertMovie(state, source, input).resources[0];
+  Object.assign(resource.probe, { status: 'ok', checkedAt: '2026-11-01T00:01:00Z', width: 1920, height: 1080, speedMbps: 8.5 });
+  upsertMovie(state, source, { ...input, resources: [{ ...input.resources[0], url: 'https://cdn.example.com/new.m3u8', resolvedAt: '2026-11-04T00:00:00Z' }] });
+  assert.ok(resource.urlHistory?.some(entry => entry.url === 'https://cdn.example.com/old.m3u8'));
+  assert.ok(resource.probeHistory?.some(entry => entry.width === 1920 && entry.speedMbps === 8.5));
+  assert.equal(resource.probe.status, 'pending');
+});
 test('different sources merge explicit title/year/type matches and retain both references', () => {
   const state = initialState(); const one = sourceDefaults({ baseUrl: 'https://one.example' }); const two = sourceDefaults({ baseUrl: 'https://two.example' });
   upsertMovie(state, one, { externalId: '1', pageUrl: '/', title: '同名电影', year: '2020', type: '电影', resources: [] });

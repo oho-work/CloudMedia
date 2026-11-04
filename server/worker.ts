@@ -1,11 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import type { CollectedMovie, CollectionRequest, Resource, Run, Source } from '../shared/types.js';
 import { collectSource, resolvePlaybackPage } from './collector.js';
-import { upsertMovie } from './catalog.js';
+import { rememberResource, upsertMovie } from './catalog.js';
 import { probeResource } from './hls.js';
 import { localMinute } from './scheduler.js';
 import type { Store } from './store.js';
-import { cachePoster } from './posters.js';
+import { PosterArchiver } from './poster-archive.js';
 import { emptyProbe } from './defaults.js';
 import { resolveDateRange } from './dates.js';
 
@@ -22,7 +22,8 @@ export class Worker {
   private pendingProbes = new Map<string, Promise<Resource>>();
   private probeTail: Promise<unknown> = Promise.resolve();
   private timer?: ReturnType<typeof setInterval>;
-  constructor(private store: Store) {}
+  readonly posters: PosterArchiver;
+  constructor(private store: Store) { this.posters = new PosterArchiver(store); }
   enqueue(source: Source, request: CollectionRequest = {}): Run {
     if (source.collectionMode !== 'updates' && (request.startDate !== undefined || request.endDate !== undefined)) throw new WorkerRequestError('此采集源未启用按更新日期采集', 400);
     const dateRange = source.collectionMode === 'updates' ? resolveDateRange(request, this.store.state.settings.timezone) : undefined;
@@ -70,6 +71,7 @@ export class Worker {
           let collectionErrors = 0;
           const persist = async (input: CollectedMovie) => {
             const result = upsertMovie(this.store.state, source, input);
+            if (input.poster) this.posters.recordPoster(result.movie, input.poster, input.pageUrl);
             if (!countedMovies.has(input.externalId)) {
               countedMovies.add(input.externalId); run.scanned++;
               if (result.added) run.added++; else run.updated++;
@@ -89,12 +91,9 @@ export class Worker {
             return this.store.state.resources.filter(item => item.movieId === movie?.id && item.sourceId === source.id && item.pageUrl).map(item => item.pageUrl!);
           } })) {
             signal.throwIfAborted();
-            if (input.poster) {
-              try { input.poster = await cachePoster(input.poster, input.pageUrl, this.store.state.settings); }
-              catch { /* Poster availability does not block movie metadata or playable resources. */ }
-            }
             // Save each item before probing so slow/broken hosts cannot lose collected metadata.
             const result = await persist(input);
+            await this.posters.archiveMovie(result.movie, input.poster, input.pageUrl, signal);
             signal.throwIfAborted();
             if (this.store.state.settings.probeEnabled) {
               for (const resource of result.resources) {
@@ -138,14 +137,15 @@ export class Worker {
         const resolved = await resolvePlaybackPage(source, resource.pageUrl, { settings: this.store.state.settings, signal, log: () => {} });
         const selected = resolved.find(item => item.url === resource.url) || (resolved.length === 1 ? resolved[0] : undefined);
         if (!selected) throw new Error(resolved.length ? '原始页面有多个播放地址，请从采集源重新采集以确认剧集' : '原始页面未发现公开的 m3u8 地址');
+        rememberResource(resource);
         resource.url = selected.url; resource.resolvedAt = selected.resolvedAt || new Date().toISOString();
         resource.referer = selected.referer || resource.pageUrl;
-        resource.probe = emptyProbe(); await this.store.save();
+        resource.probe = emptyProbe(); rememberResource(resource); await this.store.save();
       }
       const original = resource.url;
       const result = await probeResource({ ...resource }, { ...this.store.state.settings }, signal);
       signal.throwIfAborted();
-      if (resource.url === original) { resource.probe = result; resource.updatedAt = new Date().toISOString(); await this.store.save(); }
+      if (resource.url === original) { rememberResource(resource); resource.probe = result; rememberResource(resource); resource.updatedAt = new Date().toISOString(); await this.store.save(); }
       return resource;
     });
     this.probeTail = task.catch(() => {});
@@ -154,6 +154,7 @@ export class Worker {
     return task;
   }
   startScheduler() {
+    this.posters.start();
     const tick = async () => {
       const settings = this.store.state.settings;
       if (!settings.schedulerEnabled || this.stopping) return;
@@ -173,6 +174,7 @@ export class Worker {
   }
   async stop() {
     this.stopping = true; clearInterval(this.timer); this.controller.abort();
+    await this.posters.stop();
     for (const { run } of this.queue) { run.status = 'interrupted'; run.finishedAt = new Date().toISOString(); run.message = '服务停止，排队任务已中断'; this.runControllers.delete(run.id); }
     this.queue.length = 0;
     while (this.working) await new Promise(resolve => setTimeout(resolve, 100));

@@ -194,6 +194,14 @@ export async function resolvePlaybackPage(source: Source, pageUrl: string, conte
   return urls.map(url => ({ name: source.name, episode: '正片', url, referer: content.url, pageUrl: content.url, resolvedAt }));
 }
 
+/** Recover an old poster's URL without resolving or requesting video resources. */
+export async function resolvePosterPage(source: Source, pageUrl: string, context: CollectionContext): Promise<string> {
+  const target = absolute(pageUrl, source.baseUrl);
+  if (!target || new URL(target).origin !== new URL(source.baseUrl).origin) throw new Error('详情页必须位于当前采集源域名下');
+  const content = await new SourceClient(source, context).get(target);
+  return parseHtmlMovie(content.body, source, content.url, context.settings.timezone)?.poster || '';
+}
+
 /** Only explicit format/category names identify a series. 剧情 and 喜剧 are genres. */
 function categoryType(value: string): string | undefined {
   const name = value.replace(/[\s/|>›»：:]+/g, '');

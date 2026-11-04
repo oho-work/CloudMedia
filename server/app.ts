@@ -11,6 +11,7 @@ import { resolveDateRange } from './dates.js';
 import { nextScheduledAt } from './scheduler.js';
 import { playbackRouter } from './playback.js';
 import { posterDirectory } from './posters.js';
+import { localPosterPath } from '../shared/poster-path.js';
 
 const asyncRoute = (handler: (req: Request, res: Response) => Promise<unknown>) => (req: Request, res: Response, next: NextFunction) => { void handler(req, res).catch(next); };
 export function createApp(store: Store, worker: Worker) {
@@ -48,14 +49,18 @@ export function createApp(store: Store, worker: Worker) {
     const needle = String(search).trim().toLowerCase();
     const movies = store.state.movies.filter(movie => (!needle || `${movie.title} ${movie.originalTitle} ${movie.actors.join(' ')} ${movie.director}`.toLowerCase().includes(needle)) && (!type || movie.type === type) && (!year || movie.year === year) && (!sourceId || movie.sourceRefs.some(ref => ref.sourceId === sourceId))).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
     const counts = new Map<string, number>(); for (const resource of store.state.resources) counts.set(resource.movieId, (counts.get(resource.movieId) || 0) + 1);
-    res.json({ items: movies.slice((page - 1) * limit, page * limit).map(movie => ({ ...movie, resourceCount: counts.get(movie.id) || 0 })), total: movies.length, page, limit,
+    res.json({ items: movies.slice((page - 1) * limit, page * limit).map(movie => ({ ...movie, poster: localPosterPath(movie.poster), resourceCount: counts.get(movie.id) || 0 })), total: movies.length, page, limit,
       types: [...new Set(store.state.movies.map(movie => movie.type).filter(Boolean))].sort(), years: [...new Set(store.state.movies.map(movie => movie.year).filter(Boolean))].sort().reverse() });
   });
   app.get('/api/movies/:id', (req, res) => {
     const movie = store.state.movies.find(item => item.id === req.params.id);
     if (!movie) { res.status(404).json({ error: '影片不存在' }); return; }
-    res.json({ movie, resources: store.state.resources.filter(item => item.movieId === movie.id) });
+    res.json({ movie: { ...movie, poster: localPosterPath(movie.poster) }, resources: store.state.resources.filter(item => item.movieId === movie.id) });
   });
+  app.get('/api/archive/posters', (_req, res) => res.json(worker.posters.summary()));
+  app.post('/api/archive/posters/retry', asyncRoute(async (_req, res) => {
+    const summary = worker.posters.retry(); await store.save(); res.status(202).json(summary);
+  }));
   app.get('/api/sources', (_req, res) => res.json(store.state.sources));
   app.post('/api/sources', asyncRoute(async (req, res) => {
     const input = sourceSchema.parse(sourceDefaults(req.body));
@@ -123,6 +128,7 @@ export function createApp(store: Store, worker: Worker) {
   app.use('/api/play', playbackRouter(store));
   app.use('/api', (_req, res) => res.status(404).json({ error: '接口不存在' }));
   app.use('/media/posters', express.static(posterDirectory(), { dotfiles: 'deny', immutable: true, maxAge: '30d' }));
+  app.use('/media/posters', (_req, res) => res.status(404).end());
   app.use(express.static(path.resolve('dist'), { index: false }));
   app.get('*', (_req, res) => res.sendFile(path.resolve('dist/index.html'), error => { if (error && !res.headersSent) res.status(503).send('前端尚未构建，请运行 npm run dev 或 npm run build'); }));
   const errorHandler: ErrorRequestHandler = (error, _req, res, _next) => {

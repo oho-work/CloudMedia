@@ -2,6 +2,8 @@
 
 提供 Node.js 24 多阶段镜像和 Docker Compose 配置。镜像构建前端及服务端，运行时使用普通用户；数据库资料和海报通过持久卷保存，容器重建后继续保留。
 
+图片保存为 `/app/data/posters` 下的普通文件，图片二进制不存入 PostgreSQL。默认 `app-data` 卷包含这些永久图片；不要用容器临时文件层保存海报，也不要在未备份时删除该卷。迁移/恢复必须同时处理 PostgreSQL 和图片卷。页面不回退源站图片，后台补存及失败重试进度可在“系统设置”的“图片永久归档”查看。
+
 需要 Docker Engine 或 Docker Desktop（Linux 容器模式）以及 Docker Compose v2。以下命令均在项目根目录运行。示例使用 PowerShell；Linux/macOS 将 `Copy-Item` 换成 `cp`，创建备份目录时将 `New-Item -ItemType Directory -Force backup` 换成 `mkdir -p backup`。
 
 尚未获取源码时，先按 [README 中的步骤](README.md#环境与启动) 克隆 `git@github.com:oho-work/CloudMedia.git` 的 `dev` 分支。镜像仅包含构建后的应用，不包含个人 `.env`、本地采集数据或海报；已有部署的数据迁移步骤见下文。

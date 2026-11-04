@@ -27,11 +27,20 @@ export interface ProbeResult {
 export interface Resource {
   id: string; movieId: string; sourceId: string; name: string; episode: string;
   url: string; referer: string; pageUrl?: string; resolvedAt?: string; probe: ProbeResult; createdAt: string; updatedAt: string;
+  urlHistory?: { url: string; referer: string; pageUrl?: string; resolvedAt?: string; archivedAt: string }[];
+  probeHistory?: ProbeResult[];
+}
+export interface PosterArchive {
+  status: 'pending' | 'saved' | 'error' | 'missing';
+  originalUrl: string; referer: string; path: string;
+  sha256?: string; mime?: string; bytes?: number; downloadedAt?: string;
+  attempts: number; lastAttemptAt: string | null; nextRetryAt: string | null; error: string | null;
 }
 export interface Movie {
   id: string; title: string; originalTitle: string; year: string; region: string;
   type: string; genres: string[]; director: string; actors: string[]; description: string;
   poster: string; rating: string; status: string; externalIds: Record<string, string>;
+  posterArchive?: PosterArchive;
   sourceRefs: { sourceId: string; externalId: string; pageUrl: string; updatedOn?: string }[];
   createdAt: string; updatedAt: string;
 }

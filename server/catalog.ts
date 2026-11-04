@@ -3,6 +3,15 @@ import type { CollectedMovie, Movie, Resource, Source, State } from '../shared/t
 import { emptyProbe } from './defaults.js';
 
 function normalized(value: string) { return value.normalize('NFKC').toLowerCase().replace(/[\s·:：!！?？\-—_]/g, ''); }
+/** Keep previous addresses and measurements when a source rotates its links. */
+export function rememberResource(resource: Resource) {
+  resource.urlHistory ??= [];
+  if (!resource.urlHistory.some(item => item.url === resource.url && item.resolvedAt === resource.resolvedAt)) {
+    resource.urlHistory.push({ url: resource.url, referer: resource.referer, pageUrl: resource.pageUrl, resolvedAt: resource.resolvedAt, archivedAt: new Date().toISOString() });
+  }
+  resource.probeHistory ??= [];
+  if (resource.probe.checkedAt && !resource.probeHistory.some(item => JSON.stringify(item) === JSON.stringify(resource.probe))) resource.probeHistory.push(structuredClone(resource.probe));
+}
 export function upsertMovie(state: State, source: Source, input: CollectedMovie): { movie: Movie; added: boolean; resources: Resource[] } {
   const now = new Date().toISOString();
   const title = input.title.trim();
@@ -35,16 +44,19 @@ export function upsertMovie(state: State, source: Source, input: CollectedMovie)
     if (!['http:', 'https:'].includes(url.protocol)) continue;
     const existing = state.resources.find(item => item.movieId === movie!.id && item.sourceId === source.id && item.name === entry.name && item.episode === entry.episode);
     if (existing) {
+      rememberResource(existing);
       const resolvedAt = entry.resolvedAt || now;
       if (existing.url !== url.href || existing.resolvedAt !== resolvedAt) { existing.url = url.href; existing.probe = emptyProbe(); }
       existing.referer = entry.referer || source.referer || input.pageUrl;
       if (entry.pageUrl) existing.pageUrl = entry.pageUrl;
       existing.resolvedAt = resolvedAt;
       existing.updatedAt = now;
+      rememberResource(existing);
       resources.push(existing);
     } else {
       const resource: Resource = { id: randomUUID(), movieId: movie.id, sourceId: source.id, name: entry.name || source.name, episode: entry.episode || '正片', url: url.href, referer: entry.referer || source.referer || input.pageUrl, pageUrl: entry.pageUrl, resolvedAt: entry.resolvedAt || now, probe: emptyProbe(), createdAt: now, updatedAt: now };
       state.resources.push(resource); resources.push(resource);
+      rememberResource(resource);
     }
   }
   return { movie, added, resources };

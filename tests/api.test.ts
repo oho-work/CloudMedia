@@ -172,6 +172,10 @@ test('API, collector, worker, HLS probing and file persistence work together', {
     firstResourceId = resource.id;
     assert.equal(movie.title, '集成测试电影'); assert.equal(movie.year, '2026'); assert.deepEqual(movie.actors, ['甲', '乙']);
     assert.match(movie.poster, /^\/media\/posters\//, 'poster must be cached in the isolated temporary directory');
+    assert.equal(movie.posterArchive?.status, 'saved');
+    const posterResponse = await fetch(apiOrigin + movie.poster);
+    assert.equal(posterResponse.status, 200); assert.match(posterResponse.headers.get('content-type') || '', /^image\/png/);
+    assert.equal((await posterResponse.arrayBuffer()).byteLength, movie.posterArchive?.bytes);
     assert.equal(resource.probe.status, 'ok', resource.probe.error ?? '');
     assert.equal(resource.probe.width, 1920); assert.equal(resource.probe.height, 1080);
     assert.equal(resource.probe.sampledSegments, 1); assert.equal(resource.probe.bytesRead, 16384);
@@ -179,6 +183,24 @@ test('API, collector, worker, HLS probing and file persistence work together', {
     assert.deepEqual(upstreamCalls.filter(item => item.path === '/segment.ts').map(item => item.range), ['bytes=0-16383']);
     const persisted = JSON.parse(await readFile(snapshotPath, 'utf8'));
     assert.equal(persisted.movies[0].id, firstMovieId); assert.equal(persisted.resources[0].probe.status, 'ok');
+    assert.ok(persisted.resources[0].probeHistory.some((entry: {width:number}) => entry.width === 1920));
+  });
+
+  await t.test('image archive summary is available and absent poster files return 404 instead of frontend HTML', async () => {
+    const summary = await request('/api/archive/posters');
+    assert.equal(summary.status, 200); assert.equal(summary.body.total, 1); assert.equal(summary.body.saved, 1);
+    const missing = await fetch(apiOrigin + '/media/posters/' + '0'.repeat(64) + '.png');
+    assert.equal(missing.status, 404); assert.equal(await missing.text(), '');
+    assert.equal((await request('/api/archive/posters', 'GET', undefined, false)).status, 401);
+  });
+
+  await t.test('legacy external posters are never exposed as display image addresses', async () => {
+    const original = store!.state.movies[0].poster;
+    try {
+      store!.state.movies[0].poster = upstreamOrigin + '/poster.png';
+      assert.equal((await request('/api/movies')).body.items[0].poster, '');
+      assert.equal((await request(`/api/movies/${firstMovieId}`)).body.movie.poster, '');
+    } finally { store!.state.movies[0].poster = original; }
   });
 
   await t.test('repeated collection preserves movie and resource identities', async () => {
@@ -210,6 +232,8 @@ test('API, collector, worker, HLS probing and file persistence work together', {
     refreshedResolvedAt = resource.resolvedAt!;
     assert.equal(resource.probe.status, 'ok', resource.probe.error ?? '');
     assert.equal(resource.probe.width, 1920); assert.equal(resource.probe.sampledSegments, 1);
+    assert.ok(resource.urlHistory?.some(entry => entry.url === previous.url));
+    assert.ok(resource.probeHistory?.some(entry => entry.checkedAt === previous.probe.checkedAt));
     assert.ok(resource.probe.checkedAt! > previous.probe.checkedAt!);
     assert.equal(upstreamCalls.filter(item => item.path === '/segment.ts').length, previousSampleCount + 1);
     assert.ok(upstreamCalls.some(item => item.path === '/segment.ts' && item.query === '?token=renewed-signature'));
