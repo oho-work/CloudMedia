@@ -4,7 +4,6 @@ import { initialState, sourceDefaults } from '../server/defaults.js';
 import { upsertMovie } from '../server/catalog.js';
 import { nextScheduledAt, localMinute } from '../server/scheduler.js';
 import { sourceSchema, settingsSchema } from '../server/validation.js';
-import { parseJsonMovie } from '../server/collector.js';
 
 test('resource Referer follows the original page and ignores legacy source overrides', () => {
   const state = initialState();
@@ -18,10 +17,10 @@ test('resource Referer follows the original page and ignores legacy source overr
   assert.equal(upsertMovie(state, source, { ...input, resources: [{ ...input.resources[0], referer: playPage }] }).resources[0].referer, playPage);
 });
 
-test('empty episode labels from JSON collection keep a stable resource identity', () => {
+test('empty episode labels keep a stable resource identity', () => {
   // Lookup and insertion must use the same default episode, including a channel with no episode label.
   const state = initialState(); const source = sourceDefaults({ name: 'Fixture', baseUrl: 'https://example.com' });
-  const input = parseJsonMovie({ vod_id: 1, vod_name: '电影', vod_play_url: '$https://example.com/video.m3u8' }, source, source.baseUrl)!;
+  const input = { externalId: '1', pageUrl: source.baseUrl, title: '电影', resources: [{ name: '默认线路', episode: '', url: 'https://example.com/video.m3u8' }] };
   const first = upsertMovie(state, source, input).resources[0];
   const second = upsertMovie(state, source, input).resources[0];
   assert.equal(state.resources.length, 1);
@@ -106,7 +105,7 @@ test('scheduler uses configured Shanghai timezone even on another host timezone'
 });
 test('configuration rejects unsafe schemes, extreme probing, and invalid timezone', () => {
   assert.equal(sourceSchema.safeParse(sourceDefaults({ baseUrl: 'file:///etc/passwd' })).success, false);
-  assert.equal(sourceSchema.safeParse(sourceDefaults({ baseUrl: 'https://example.com', requestIntervalMs: 0 })).success, false);
+  assert.equal(sourceSchema.safeParse(sourceDefaults({ baseUrl: 'https://example.com', requestIntervalMs: -1 })).success, false);
   assert.equal(settingsSchema.safeParse({ ...initialState().settings, sampleSegments: 100 }).success, false);
   assert.equal(settingsSchema.safeParse({ ...initialState().settings, timezone: 'unknown' }).success, false);
 });

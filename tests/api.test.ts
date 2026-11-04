@@ -62,14 +62,8 @@ test('API, collector, worker, HLS probing and file persistence work together', {
     upstreamCalls.push({ path: url.pathname, query: url.search, range: request.headers.range });
     if (url.pathname === '/robots.txt') return response.end('User-agent: *\nDisallow:\n');
     if (url.pathname === '/catalog') {
-      response.setHeader('Content-Type', 'application/json');
-      return response.end(JSON.stringify({ list: [{
-        id: 77, vod_name: '集成测试电影', vod_year: '2026', type_name: '电影',
-        vod_area: '中国大陆', vod_director: '测试导演', vod_actor: '甲,乙',
-        vod_content: '<p>公开影片资料</p>', vod_pic: upstreamOrigin + '/poster.png',
-        pageUrl: upstreamOrigin + '/voddetail/77',
-        vod_play_from: '测试蓝光', vod_play_url: '正片$' + upstreamOrigin + '/master.m3u8?token=' + playbackToken,
-      }] }));
+      response.setHeader('Content-Type', 'text/html; charset=utf-8');
+      return response.end('<a href="/voddetail/77">集成测试电影</a>');
     }
     if (url.pathname === '/cancel-list') return response.end('<a href="/voddetail/cancel">可中断剧集</a>');
     if (url.pathname === '/voddetail/cancel') return response.end('<h1>检查点剧集</h1>' + Array.from({ length: 12 }, (_value, index) => `<a href="/vodplay/cancel-${index + 1}">第${index + 1}集</a>`).join(''));
@@ -88,7 +82,15 @@ test('API, collector, worker, HLS probing and file persistence work together', {
     if (url.pathname.startsWith('/vodplay/mid-')) return response.end(`<script>var player_fixture=${JSON.stringify({ url: upstreamOrigin + url.pathname + '.m3u8' })}</script>`);
     if (url.pathname === '/voddetail/77') {
       response.setHeader('Content-Type', 'text/html; charset=utf-8');
-      return response.end(`<h1>集成测试电影</h1><script>var player_aaaa=${JSON.stringify({ encrypt: 0, url: upstreamOrigin + '/master.m3u8?token=' + playbackToken })}</script>`);
+      return response.end(`<h1>集成测试电影</h1>
+        <div class="module-info-item"><span class="module-info-item-title">年份：</span><div class="module-info-item-content">2026</div></div>
+        <div class="module-info-item"><span class="module-info-item-title">分类：</span><div class="module-info-item-content">电影</div></div>
+        <div class="module-info-item"><span class="module-info-item-title">地区：</span><div class="module-info-item-content">中国大陆</div></div>
+        <div class="module-info-item"><span class="module-info-item-title">导演：</span><div class="module-info-item-content">测试导演</div></div>
+        <div class="module-info-item"><span class="module-info-item-title">主演：</span><div class="module-info-item-content">甲,乙</div></div>
+        <div class="module-info-introduction"><p>公开影片资料</p></div>
+        <div class="module-item-pic"><img src="/poster.png"></div>
+        <script>var player_aaaa=${JSON.stringify({ encrypt: 0, url: upstreamOrigin + '/master.m3u8?token=' + playbackToken })}</script>`);
     }
     if (url.pathname === '/poster.png') {
       response.setHeader('Content-Type', 'image/png');
@@ -158,9 +160,10 @@ test('API, collector, worker, HLS probing and file persistence work together', {
     assert.equal(valid.status, 200);
   });
 
-  await t.test('a new JSON source can be collected, persisted and probed through the API', async () => {
-    const created = await request('/api/sources', 'POST', sourceDefaults({ name: '本地公开测试源', baseUrl: upstreamOrigin, adapter: 'json', listPath: '/catalog', maxPages: 1, maxItems: 1, maxResourcePages: 1, requestIntervalMs: 1000 }));
+  await t.test('a new HTML source can be collected, persisted and probed through the API', async () => {
+    const created = await request('/api/sources', 'POST', sourceDefaults({ name: '本地公开测试源', baseUrl: upstreamOrigin, listPath: '/catalog', maxPages: 1, maxItems: 1, maxResourcePages: 1, requestIntervalMs: 0 }));
     assert.equal(created.status, 201); source = created.body;
+    assert.equal(source.adapter, 'html'); assert.equal(source.requestIntervalMs, 0);
     const queued = await request(`/api/sources/${source.id}/run`, 'POST');
     assert.equal(queued.status, 202);
     const run = await awaitRun(queued.body.id);

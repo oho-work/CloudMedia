@@ -4,7 +4,7 @@ import { after, before, test } from 'node:test';
 import type { AddressInfo } from 'node:net';
 import { gzipSync } from 'node:zlib';
 import type { CollectedMovie } from '../shared/types.js';
-import { collectSource, extractPlayerUrls, orderPlaybackPages, parseHtmlMovie, parseJsonMovie, parsePlayUrls, resolvePlaybackPage } from '../server/collector.js';
+import { collectSource, extractPlayerUrls, orderPlaybackPages, parseHtmlMovie, resolvePlaybackPage } from '../server/collector.js';
 import { defaultSettings, sourceDefaults } from '../server/defaults.js';
 import { isPublicAddress, readTextLimited, safeFetch, safeUrlLabel } from '../server/upstream.js';
 
@@ -29,18 +29,17 @@ const server = createServer((request, response) => {
     const id = url.pathname.endsWith('-a') ? '41' : '42';
     return response.end(`<a href="/bulkdetail/${id}">movie</a><a title="下一页" href="/cycle-list-${id === '41' ? 'b' : 'a'}">next</a>`);
   }
-  if (url.pathname === '/json-unlimited') {
-    const page = Number(url.searchParams.get('pg') || url.searchParams.get('page') || 1);
-    return response.end(JSON.stringify({ pagecount: 3, list: Array.from({ length: 11 }, (_item, index) => ({ vod_id: (page - 1) * 11 + index + 1, vod_name: `API影片${(page - 1) * 11 + index + 1}` })) }));
-  }
-  if (url.pathname === '/json-repeat') return response.end(JSON.stringify({ pagecount: 1000000, list: [{ vod_id: 1, vod_name: '分页参数被忽略' }] }));
-  if (url.pathname === '/json-cycle') {
+  if (url.pathname === '/repeat-list') {
     const page = Number(url.searchParams.get('page') || 1);
-    return response.end(JSON.stringify({ list: [{ vod_id: page, vod_name: `循环影片${page}` }], next: `/json-cycle?page=${page === 1 ? 2 : 1}` }));
+    return response.end(`<a href="/bulkdetail/41">repeat</a><a title="下一页" href="/repeat-list?page=${page + 1}">next</a>`);
   }
-  if (url.pathname === '/json-empty-stop') {
-    const page = Number(url.searchParams.get('pg') || 1);
-    return response.end(JSON.stringify({ list: page < 4 ? [{ vod_id: page, vod_name: `直到空页${page}` }] : [] }));
+  if (url.pathname === '/empty-stop-list') {
+    const page = Number(url.searchParams.get('page') || 1);
+    return response.end(page < 4 ? `<a href="/bulkdetail/${page + 50}">movie</a><a title="下一页" href="/empty-stop-list?page=${page + 1}">next</a>` : '<p>暂无影片</p>');
+  }
+  if (url.pathname === '/custom-list') return response.end('<article class="tile"><a class="watch" href="/custom-detail">movie</a></article><a href="/voddetail/1">unrelated</a>');
+  if (url.pathname === '/custom-detail') {
+    return response.end('<h1>Unselected title</h1><h2 class="film-title">自定义选择器影片</h2><div class="cover"><img data-src="/custom-poster.jpg"></div><section class="synopsis"><p>公开简介</p></section><div class="episodes" data-name="公开线路"><a href="/direct.m3u8">正片</a><a href="/vodplay/custom">预告</a></div><a href="/vodplay/unrelated">广告</a>');
   }
   if (url.pathname === '/voddetail/2') return response.end('<h1>部分播放页失效</h1><a href="/vodplay/missing">第01集</a><a href="/vodplay/2-a-2">第02集</a>');
   if (url.pathname === '/voddetail/1') return response.end(`
@@ -55,7 +54,6 @@ const server = createServer((request, response) => {
     <div class="module-play-list"><a href="/vodplay/1-b-1">第01集</a></div>`);
   if (url.pathname === '/vodplay/missing') { response.writeHead(404); return response.end('Gone'); }
   if (url.pathname.startsWith('/vodplay/')) return response.end(`<script>var player_aaaa=${JSON.stringify({ encrypt: 0, url: origin + url.pathname + '.m3u8', url_next: origin + '/wrong-next.m3u8' })}</script>`);
-  if (url.pathname === '/api') return response.end(JSON.stringify({ pagecount: 1, list: [{ vod_id: 7, vod_name: 'API电影', vod_year: '2025', vod_play_from: '公开源', vod_play_url: '正片$https://cdn.example.org/index.m3u8' }] }));
   if (url.pathname === '/forbidden') { response.writeHead(403); return response.end('Denied'); }
   if (url.pathname === '/challenge') return response.end('<title>Bot detection</title><div id="xcdn-captcha">人机验证</div>');
   if (url.pathname === '/gzip') { response.setHeader('content-encoding', 'gzip'); return response.end(gzipSync('压缩页面')); }
@@ -67,7 +65,7 @@ const server = createServer((request, response) => {
 before(async () => { previousPrivate = process.env.ALLOW_PRIVATE_UPSTREAM; process.env.ALLOW_PRIVATE_UPSTREAM = 'true'; await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve)); origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`; });
 after(async () => { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); if (previousPrivate === undefined) delete process.env.ALLOW_PRIVATE_UPSTREAM; else process.env.ALLOW_PRIVATE_UPSTREAM = previousPrivate; });
 const context = (logs: string[] = []) => ({ settings: { ...defaultSettings, maxRetries: 0 }, log: (message: string) => logs.push(message) });
-const fixtureSource = (extra: Parameters<typeof sourceDefaults>[0] = {}) => sourceDefaults({ baseUrl: origin, listPath: '/list', requestIntervalMs: 500, maxItems: 1, maxPages: 1, maxResourcePages: 10, ...extra });
+const fixtureSource = (extra: Parameters<typeof sourceDefaults>[0] = {}) => sourceDefaults({ baseUrl: origin, listPath: '/list', requestIntervalMs: 0, maxItems: 1, maxPages: 1, maxResourcePages: 10, ...extra });
 
 test('player extraction ignores next episode, handles ordinary URL encodings, and never evaluates scripts', () => {
   const url = 'https://cdn.example.com/movie/index.m3u8?token=a&b=2';
@@ -77,14 +75,24 @@ test('player extraction ignores next episode, handles ordinary URL encodings, an
   assert.deepEqual(extractPlayerUrls(`<script>var player_one={"encrypt":1,"url":"${encodeURIComponent(url)}"};</script>`, 'https://site.example'), [url]);
 });
 
-test('MacCMS channel parsing preserves every episode and excludes wrapper player pages', () => {
-  assert.deepEqual(parsePlayUrls('第1集$https://a.example/1.m3u8#第2集$https://a.example/2.m3u8$$$正片$https://b.example/player?id=1', '蓝光$$$包装页'), [
-    { name: '蓝光', episode: '第1集', url: 'https://a.example/1.m3u8' },
-    { name: '蓝光', episode: '第2集', url: 'https://a.example/2.m3u8' },
+test('custom CSS selectors collect only selected metadata and public episode links', async () => {
+  calls.length = 0;
+  const movies: CollectedMovie[] = [];
+  for await (const movie of collectSource(fixtureSource({ listPath: '/custom-list', detailLinkSelector: '.tile a.watch',
+    titleSelector: '.film-title', posterSelector: '.cover img', descriptionSelector: '.synopsis', resourceSelector: '.episodes a',
+  }), context())) movies.push(movie);
+  assert.equal(movies.length, 1);
+  const movie = movies[0];
+  assert.equal(movie.title, '自定义选择器影片');
+  assert.equal(movie.description, '公开简介');
+  assert.equal(movie.poster, origin + '/custom-poster.jpg');
+  assert.deepEqual(movie.resources.map(resource => [resource.name, resource.episode, resource.url]), [
+    ['公开线路', '正片', origin + '/direct.m3u8'],
+    ['公开线路', '预告', origin + '/vodplay/custom.m3u8'],
   ]);
-  const movie = parseJsonMovie({ vod_id: 1, vod_name: '标题', vod_content: '<p>简介</p>', vod_pic: '/p.jpg', vod_play_url: 'https://cdn.example/1.m3u8' }, fixtureSource(), origin);
-  assert.equal(movie?.description, '简介'); assert.equal(movie?.poster, origin + '/p.jpg');
-  assert.equal(movie?.resources[0].referer, origin);
+  assert.ok(!calls.includes('/voddetail/1'));
+  assert.ok(!calls.includes('/vodplay/unrelated'));
+  assert.ok(!calls.includes('/direct.m3u8'), 'direct stream links do not require a playback page request');
 });
 
 test('HTML collection deduplicates detail/play links and preserves stable line and episode identity', async () => {
@@ -105,9 +113,10 @@ test('legacy per-film playback limits no longer skip pending episodes', async ()
   assert.equal(movies[0].resources.length, 3); assert.ok(!logs.some(message => message.includes('前 1 个')));
 });
 
-test('MacCMS collection reads public JSON without requesting unrelated pages', async () => {
-  const movies = []; for await (const movie of collectSource(fixtureSource({ adapter: 'maccms', listPath: '/api' }), context())) movies.push(movie);
-  assert.equal(movies[0].title, 'API电影'); assert.equal(movies[0].resources[0].name, '公开源');
+test('an unmatched detail CSS selector reports a useful collection error', async () => {
+  await assert.rejects(async () => {
+    for await (const _movie of collectSource(fixtureSource({ detailLinkSelector: '.missing-detail-link' }), context())) {}
+  }, /详情链接 CSS 选择器/);
 });
 
 test('forbidden and challenge targets stop collection', async () => {
@@ -233,21 +242,19 @@ test('unlimited HTML pagination stops an A to B to A loop without refetching lis
   assert.equal(calls.filter(path => path === '/cycle-list-a').length, 1); assert.equal(calls.filter(path => path === '/cycle-list-b').length, 1);
 });
 
-test('MacCMS and JSON collect all advertised pages and more than thirty unique titles', async () => {
-  for (const adapter of ['maccms', 'json'] as const) {
-    const movies = []; for await (const movie of collectSource(fixtureSource({ adapter, listPath: '/json-unlimited', maxPages: 0, maxItems: 0 }), context())) movies.push(movie);
-    assert.equal(movies.length, 33); assert.equal(new Set(movies.map(movie => movie.externalId)).size, 33);
-  }
+test('HTML pagination stops repeated detail content even when next-page URLs keep changing', async () => {
+  calls.length = 0;
+  const movies: CollectedMovie[] = [];
+  for await (const movie of collectSource(fixtureSource({ listPath: '/repeat-list', detailLinkSelector: 'a[href^="/bulkdetail/"]' }), context())) movies.push(movie);
+  assert.equal(movies.length, 1);
+  assert.equal(calls.filter(path => path === '/repeat-list').length, 2);
+  assert.equal(calls.filter(path => path === '/bulkdetail/41').length, 1);
 });
 
-test('unlimited JSON guards repeated content and explicit next-URL cycles; MacCMS stops on an empty page', async () => {
-  const repeated = []; let beforeCount = calls.filter(path => path === '/json-repeat').length;
-  for await (const movie of collectSource(fixtureSource({ adapter: 'maccms', listPath: '/json-repeat', maxPages: 0, maxItems: 0 }), context())) repeated.push(movie);
-  assert.equal(repeated.length, 1); assert.equal(calls.filter(path => path === '/json-repeat').length - beforeCount, 2);
-  const cycle = []; beforeCount = calls.filter(path => path === '/json-cycle').length;
-  for await (const movie of collectSource(fixtureSource({ adapter: 'json', listPath: '/json-cycle', maxPages: 0, maxItems: 0 }), context())) cycle.push(movie);
-  assert.equal(cycle.length, 2); assert.equal(calls.filter(path => path === '/json-cycle').length - beforeCount, 2);
-  const empty = []; beforeCount = calls.filter(path => path === '/json-empty-stop').length;
-  for await (const movie of collectSource(fixtureSource({ adapter: 'maccms', listPath: '/json-empty-stop', maxPages: 0, maxItems: 0 }), context())) empty.push(movie);
-  assert.equal(empty.length, 3); assert.equal(calls.filter(path => path === '/json-empty-stop').length - beforeCount, 4);
+test('HTML pagination keeps collected titles when the next list page is empty', async () => {
+  calls.length = 0;
+  const movies: CollectedMovie[] = [];
+  for await (const movie of collectSource(fixtureSource({ listPath: '/empty-stop-list', detailLinkSelector: 'a[href^="/bulkdetail/"]' }), context())) movies.push(movie);
+  assert.deepEqual(movies.map(movie => movie.title), ['影片51', '影片52', '影片53']);
+  assert.equal(calls.filter(path => path === '/empty-stop-list').length, 4);
 });

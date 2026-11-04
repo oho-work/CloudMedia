@@ -12,12 +12,14 @@ async function fixture(t: TestContext, failingSaves: number[], beforeSave?: (att
   const previousPrivate = process.env.ALLOW_PRIVATE_UPSTREAM;
   process.env.ALLOW_PRIVATE_UPSTREAM = 'true';
   const upstream = createServer((_request, response) => {
-    response.setHeader('Content-Type', 'application/json'); response.end('{"list":[]}');
+    response.setHeader('Content-Type', 'text/html; charset=utf-8'); response.end('<html><body>暂无影片</body></html>');
   });
   await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve));
   const origin = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`;
   const state = initialState();
-  state.sources = ['first', 'second'].map(id => sourceDefaults({ id, name: id, baseUrl: origin, adapter: 'json', listPath: '/catalog', respectRobots: false }));
+  // An explicitly empty daily HTML feed completes without per-movie writes, so
+  // save attempts still identify the initial and final task persistence boundaries.
+  state.sources = ['first', 'second'].map(id => sourceDefaults({ id, name: id, baseUrl: origin, collectionMode: 'today', listPath: '/catalog', requestIntervalMs: 0, respectRobots: false }));
   Object.assign(state.settings, { schedulerEnabled: false, probeEnabled: false, maxRetries: 0 });
   let saveCount = 0;
   let durable: State | undefined;

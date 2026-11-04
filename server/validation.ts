@@ -6,19 +6,17 @@ const httpUrl = z.string().max(4096).refine(value => {
 }, '请输入有效的 HTTP/HTTPS 地址（不能包含用户名或密码）');
 export const sourceSchema = z.object({
   name: z.string().trim().min(1).max(100), baseUrl: httpUrl,
-  adapter: z.enum(['maccms', 'html', 'json']), enabled: z.boolean(),
+  adapter: z.literal('html').default('html'), enabled: z.boolean(),
   collectionMode: z.enum(['all', 'updates', 'today', 'range']).default('all').transform(value => value === 'updates' ? 'today' : value),
   startDate: collectionDate.optional(), endDate: collectionDate.optional(),
   updatesSortedDescending: z.boolean().default(false),
   listPath: z.string().max(2048), detailLinkSelector: z.string().max(1000), titleSelector: z.string().max(1000),
   posterSelector: z.string().max(1000), descriptionSelector: z.string().max(1000), resourceSelector: z.string().max(1000), nextPageSelector: z.string().max(1000),
-  jsonItemsPath: z.string().max(200), jsonTitleField: z.string().max(200), jsonUrlField: z.string().max(200),
-  requestIntervalMs: z.number().int().min(1000).max(60000),
+  requestIntervalMs: z.number().int().min(0).max(60000),
   // Load older saved configurations while ignoring controls that no longer exist.
   maxPages: z.unknown().transform(() => 0), maxItems: z.unknown().transform(() => 0), maxResourcePages: z.unknown().transform(() => 0),
   respectRobots: z.unknown().transform(() => false), referer: z.unknown().transform(() => ''),
 }).superRefine((value, context) => {
-  if (value.collectionMode !== 'all' && value.adapter !== 'html') context.addIssue({ code: 'custom', message: '按日期采集需要 HTML 页面适配器', path: ['collectionMode'] });
   if (value.collectionMode === 'range') {
     if (!value.startDate || !value.endDate) context.addIssue({ code: 'custom', message: '请选择完整的起止日期', path: ['startDate'] });
     else if (value.startDate > value.endDate) context.addIssue({ code: 'custom', message: '开始日期不能晚于结束日期', path: ['endDate'] });

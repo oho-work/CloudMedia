@@ -17,7 +17,6 @@ function collectionRange(source: Source, request: CollectionRequest, timezone: s
   const hasDates = request.startDate !== undefined || request.endDate !== undefined;
   const mode = request.mode || (hasDates ? 'range' : source.collectionMode === 'updates' ? 'today' : source.collectionMode || 'all');
   if (mode === 'all') return undefined;
-  if (source.adapter !== 'html') throw new WorkerRequestError('按日期采集需要 HTML 页面适配器', 400);
   try {
     if (mode === 'today') return resolveDateRange({}, timezone);
     const dates = hasDates ? request : { startDate: source.startDate, endDate: source.endDate };

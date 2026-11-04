@@ -4,13 +4,7 @@ import type { CollectedMovie, CollectedResource, CollectionContext, Source } fro
 import { readTextLimited, safeFetch, safeUrlLabel } from './upstream.js';
 import { resolveDateRange, sourceDate } from './dates.js';
 
-type Json = Record<string, any>;
-function field(value: any, path: string): any {
-  if (!path) return value;
-  return path.split('.').reduce((item, key) => item?.[key], value);
-}
 function text(value: any): string { return value === undefined || value === null ? '' : String(value).trim(); }
-function cleanHtml(value: any): string { const doc = load(text(value)); doc('script,style').remove(); return doc.root().text().replace(/\s+/g, ' ').trim(); }
 function list(value: any): string[] { return Array.isArray(value) ? value.map(text).filter(Boolean) : text(value).split(/[,，、/]/).map(item => item.trim()).filter(Boolean); }
 function absolute(value: string, base: string): string {
   if (!value.trim()) return '';
@@ -18,21 +12,6 @@ function absolute(value: string, base: string): string {
 }
 function isHls(value: string): boolean { try { return /\.m3u8(?:$|[?#])/i.test(new URL(value).href); } catch { return false; } }
 function pageKey(value: string): string { const url = new URL(value); url.hash = ''; return url.href; }
-
-export function parsePlayUrls(value: unknown, names: unknown = '', base = ''): CollectedResource[] {
-  const channels = text(names).split('$$$');
-  const resources: CollectedResource[] = [];
-  text(value).split('$$$').forEach((channel, index) => {
-    channel.split('#').forEach((entry, number) => {
-      const split = entry.indexOf('$');
-      const episode = split >= 0 ? entry.slice(0, split).trim() : `正片${number ? ` ${number + 1}` : ''}`;
-      const raw = split >= 0 ? entry.slice(split + 1).trim() : entry.trim();
-      const url = absolute(raw, base);
-      if (isHls(url)) resources.push({ name: channels[index] || `线路 ${index + 1}`, episode, url });
-    });
-  });
-  return resources;
-}
 
 /** Extract only literal player data, never execute page JavaScript. */
 export function extractPlayerUrls(html: string, base: string, includeAnchors = true): string[] {
@@ -65,37 +44,15 @@ export function extractPlayerUrls(html: string, base: string, includeAnchors = t
   return [...found];
 }
 
-export function parseJsonMovie(item: Json, source: Source, pageUrl: string): CollectedMovie | null {
-  const title = text(field(item, source.jsonTitleField) ?? item.vod_name ?? item.title ?? item.name);
-  if (!title) return null;
-  const resourceValue = field(item, source.jsonUrlField) ?? item.vod_play_url ?? item.m3u8 ?? item.url;
-  let resources = parsePlayUrls(resourceValue, item.vod_play_from, source.baseUrl);
-  if (Array.isArray(resourceValue)) resources = resourceValue.flatMap((resource: any, index: number) => {
-    const url = absolute(text(resource.url ?? resource.m3u8 ?? resource), source.baseUrl);
-    return isHls(url) ? [{ name: text(resource.name) || '默认线路', episode: text(resource.episode) || `第 ${index + 1} 集`, url }] : [];
-  });
-  const id = text(item.vod_id ?? item.id ?? item.externalId) || `${title}:${text(item.vod_year ?? item.year)}`;
-  const detailPage = absolute(text(item.pageUrl ?? item.vod_detail_url), source.baseUrl) || pageUrl;
-  resources = resources.map(resource => ({ ...resource, referer: detailPage, pageUrl: detailPage, resolvedAt: new Date().toISOString() }));
-  return { externalId: id, pageUrl: detailPage,
-    title, originalTitle: text(item.vod_en ?? item.originalTitle), year: text(item.vod_year ?? item.year),
-    region: text(item.vod_area ?? item.region), type: text(item.type_name ?? item.type),
-    genres: list(item.vod_class ?? item.genres), director: text(item.vod_director ?? item.director),
-    actors: list(item.vod_actor ?? item.actors), description: cleanHtml(item.vod_content ?? item.description),
-    poster: absolute(text(item.vod_pic ?? item.poster), source.baseUrl), rating: text(item.vod_douban_score ?? item.rating),
-    status: text(item.vod_remarks ?? item.status),
-    externalIds: item.vod_douban_id ? { douban: text(item.vod_douban_id) } : {}, resources };
-}
-
 class SourceClient {
   private lastRequest = 0;
   constructor(private source: Source, private context: CollectionContext) {}
   private headers(referer: string) {
-    return { 'user-agent': this.context.settings.userAgent, accept: 'text/html,application/json;q=0.9,*/*;q=0.5', referer: new URL(referer).href };
+    return { 'user-agent': this.context.settings.userAgent, accept: 'text/html,*/*;q=0.5', referer: new URL(referer).href };
   }
   async get(value: string, referer = this.source.baseUrl): Promise<{ body: string; url: string }> {
     const url = new URL(value);
-    const interval = Math.max(500, this.source.requestIntervalMs);
+    const interval = Math.max(0, this.source.requestIntervalMs);
     for (let attempt = 0; attempt <= this.context.settings.maxRetries; attempt++) {
       try {
         const response = await safeFetch(url, { headers: this.headers(referer), signal: this.context.signal }, {
@@ -330,7 +287,6 @@ export async function* collectSource(source: Source, context: CollectionContext)
   }
   let incompletePages = 0;
   if (dateRange) {
-    if (source.adapter !== 'html') throw new Error('日期范围采集目前仅支持有明确更新时间的 HTML 列表');
     const reportError = context.onCollectionError;
     context = { ...context, dateRange, onCollectionError: message => { incompletePages++; reportError?.(message); } };
     context.log(`采集更新日期 ${dateRange.startDate} 至 ${dateRange.endDate}（${dateRange.timezone}）`);
@@ -340,135 +296,85 @@ export async function* collectSource(source: Source, context: CollectionContext)
   let pageUrl = absolute(source.listPath || '/', source.baseUrl);
   if (!pageUrl) throw new Error('源站列表地址无效');
   let count = 0;
-  if (source.adapter === 'maccms' || source.adapter === 'json') {
-    if (source.adapter === 'maccms' && (!source.listPath || source.listPath === '/')) pageUrl = new URL('/api.php/provide/vod/', source.baseUrl).href;
-    const visitedPages = new Set<string>();
-    const visitedMovies = new Set<string>();
-    const seenItemPages = new Set<string>();
-    for (let page = 1; ; page++) {
-      const url = new URL(pageUrl);
-      if (source.adapter === 'maccms') { url.searchParams.set('ac', 'detail'); url.searchParams.set('pg', String(page)); }
-      const canonical = new URL(url);
-      if (source.adapter === 'json' && !canonical.searchParams.has('page')) canonical.searchParams.set('page', '1');
-      const key = pageKey(canonical.href);
-      if (visitedPages.has(key)) { context.log('JSON 列表分页地址重复，已停止翻页'); break; }
-      visitedPages.add(key);
-      context.log(`读取列表第 ${page} 页`);
-      const response = await client.get(url.href, listingReferer);
-      listingReferer = response.url;
-      let parsed: any; try { parsed = JSON.parse(response.body); } catch { throw new Error('源站未返回 JSON；请检查适配器和列表路径'); }
-      const items = field(parsed, source.jsonItemsPath || 'list');
-      if (!Array.isArray(items)) throw new Error(`JSON 列表路径 ${source.jsonItemsPath || 'list'} 没有返回数组`);
-      if (!items.length) break;
-      const movies = items.filter((item: any) => item && typeof item === 'object').map((item: Json) => parseJsonMovie(item, source, response.url)).filter((movie: CollectedMovie | null): movie is CollectedMovie => Boolean(movie));
-      const itemPageKey = JSON.stringify(movies.map((movie: CollectedMovie) => movie.externalId).sort());
-      if (seenItemPages.has(itemPageKey)) { context.log('JSON 列表返回重复影片页，已停止翻页'); break; }
-      seenItemPages.add(itemPageKey);
-      let newMovies = 0;
-      for (const movie of movies) {
-        if (visitedMovies.has(movie.externalId)) continue;
-        visitedMovies.add(movie.externalId); newMovies++;
-        yield movie; count++;
-      }
-      if (!newMovies) { context.log('JSON 列表没有新的影片，已停止翻页'); break; }
-      const pageCount = Number(parsed.pagecount ?? parsed.pageCount ?? parsed.total_pages);
-      const currentPage = source.adapter === 'maccms' ? page : Number(parsed.page ?? parsed.currentPage ?? url.searchParams.get('page') ?? page);
-      if (Number.isFinite(pageCount) && pageCount >= 0 && currentPage >= pageCount) break;
-      if (source.adapter === 'json') {
-        const next = parsed.next ?? parsed.nextPage;
-        if (next === false || next === 0 || next === '' || ('next' in parsed && parsed.next === null) || ('nextPage' in parsed && parsed.nextPage === null)) break;
-        if (typeof next === 'string' && !/^\d+$/.test(next)) {
-          const nextUrl = absolute(next, response.url);
-          if (!nextUrl || new URL(nextUrl).origin !== new URL(response.url).origin) throw new Error('JSON 下一页地址必须位于当前源站');
-          pageUrl = nextUrl;
-        } else if (next || Number.isFinite(pageCount)) {
-          const nextUrl = new URL(response.url);
-          nextUrl.searchParams.set('page', String(typeof next === 'number' || (typeof next === 'string' && /^\d+$/.test(next)) ? next : currentPage + 1));
-          pageUrl = nextUrl.href;
-        } else break;
-      }
+  const updatePlans: HtmlPlan[] = [];
+  let reachedStart = false;
+  const visited = new Set<string>();
+  const visitedPages = new Set<string>();
+  const visitedMovies = new Set<string>();
+  for (let page = 1; pageUrl; page++) {
+    const key = pageKey(pageUrl);
+    if (visitedPages.has(key)) {
+      if (dateRange) throw new Error('更新列表分页形成循环，日期范围采集未完成');
+      context.log('列表分页地址重复，已停止翻页'); break;
     }
-  } else {
-    const updatePlans: HtmlPlan[] = [];
-    let reachedStart = false;
-    const visited = new Set<string>();
-    const visitedPages = new Set<string>();
-    const visitedMovies = new Set<string>();
-    for (let page = 1; pageUrl; page++) {
-      const key = pageKey(pageUrl);
-      if (visitedPages.has(key)) {
-        if (dateRange) throw new Error('更新列表分页形成循环，日期范围采集未完成');
-        context.log('列表分页地址重复，已停止翻页'); break;
-      }
-      visitedPages.add(key);
-      context.log(`读取页面第 ${page} 页`);
-      const response = await client.get(pageUrl, listingReferer); const $ = load(response.body);
-      listingReferer = response.url;
-      const finalKey = pageKey(response.url);
-      if (finalKey !== key && visitedPages.has(finalKey)) {
-        if (dateRange) throw new Error('更新列表重定向形成循环，日期范围采集未完成');
-        context.log('列表重定向至已访问页面，已停止翻页'); break;
-      }
-      visitedPages.add(finalKey);
-      const details = new Set<string>();
-      $(source.detailLinkSelector).each((_index, element) => {
-        const absoluteUrl = absolute($(element).attr('href') ?? '', response.url);
-        const url = absoluteUrl ? pageKey(absoluteUrl) : '';
-        if (url && new URL(url).origin === new URL(response.url).origin && !visited.has(url)) details.add(url);
-      });
-      if (!details.size && page === 1) {
-        if (dateRange && /暂无数据|暂无影片|没有找到|无相关内容/.test($('body').text())) break;
-        throw new Error('未发现影片详情链接，请检查详情链接 CSS 选择器');
-      }
-      if (!details.size && !dateRange) { context.log('列表没有新的影片链接，已停止翻页'); break; }
-      for (const detailUrl of details) {
-        visited.add(detailUrl);
-        let detail: { body: string; url: string };
-        try { detail = await client.get(detailUrl, response.url); }
-        catch (error) {
-          if (error instanceof StopError || context.signal?.aborted) throw error;
-          if (dateRange) {
-            const message = `详情页请求失败，已记录后继续采集其他影片：${safeUrlLabel(detailUrl)}（${error instanceof Error ? error.message : '请求错误'}）`;
-            context.log(message); context.onCollectionError?.(message); continue;
-          }
-          context.log(`详情页请求失败，已跳过：${safeUrlLabel(detailUrl)}`); continue;
-        }
-        const movie = parseHtmlMovie(detail.body, source, detail.url, dateRange?.timezone ?? context.settings.timezone);
-        if (!movie) {
-          if (dateRange) throw new Error(`详情页没有匹配片名，无法完成日期范围采集：${safeUrlLabel(detailUrl)}`);
-          context.log('详情页没有匹配片名，已跳过'); continue;
-        }
+    visitedPages.add(key);
+    context.log(`读取页面第 ${page} 页`);
+    const response = await client.get(pageUrl, listingReferer); const $ = load(response.body);
+    listingReferer = response.url;
+    const finalKey = pageKey(response.url);
+    if (finalKey !== key && visitedPages.has(finalKey)) {
+      if (dateRange) throw new Error('更新列表重定向形成循环，日期范围采集未完成');
+      context.log('列表重定向至已访问页面，已停止翻页'); break;
+    }
+    visitedPages.add(finalKey);
+    const details = new Set<string>();
+    $(source.detailLinkSelector).each((_index, element) => {
+      const absoluteUrl = absolute($(element).attr('href') ?? '', response.url);
+      const url = absoluteUrl ? pageKey(absoluteUrl) : '';
+      if (url && new URL(url).origin === new URL(response.url).origin && !visited.has(url)) details.add(url);
+    });
+    if (!details.size && page === 1) {
+      if (dateRange && /暂无数据|暂无影片|没有找到|无相关内容/.test($('body').text())) break;
+      throw new Error('未发现影片详情链接，请检查详情链接 CSS 选择器');
+    }
+    if (!details.size && !dateRange) { context.log('列表没有新的影片链接，已停止翻页'); break; }
+    for (const detailUrl of details) {
+      visited.add(detailUrl);
+      let detail: { body: string; url: string };
+      try { detail = await client.get(detailUrl, response.url); }
+      catch (error) {
+        if (error instanceof StopError || context.signal?.aborted) throw error;
         if (dateRange) {
-          const updatedOn = movie.sourceUpdatedOn;
-          if (!updatedOn) throw new Error(`「${movie.title}」没有有效的源站更新时间，无法按日期筛选`);
-          if (updatedOn < dateRange.startDate) {
-            if (source.updatesSortedDescending) { reachedStart = true; break; }
-            continue;
-          }
-          if (updatedOn > dateRange.endDate) continue;
+          const message = `详情页请求失败，已记录后继续采集其他影片：${safeUrlLabel(detailUrl)}（${error instanceof Error ? error.message : '请求错误'}）`;
+          context.log(message); context.onCollectionError?.(message); continue;
         }
-        if (visitedMovies.has(movie.externalId)) continue;
-        visitedMovies.add(movie.externalId);
-        const plan = htmlPlan(movie, detail, source);
-        if (dateRange) {
-          // Archive every matching title before long episode/line resolution.
-          await context.onCheckpoint?.(structuredClone(movie));
-          updatePlans.push(plan); count++;
-          context.log(`已发现 ${count} 部日期范围内影片，正在读取影片资料`);
-        } else {
-          yield await populateHtmlResources(plan, client, context); count++;
-        }
+        context.log(`详情页请求失败，已跳过：${safeUrlLabel(detailUrl)}`); continue;
       }
-      if (reachedStart) { context.log('已到达开始日期之前的记录，停止翻页'); break; }
-      const nextHref = source.nextPageSelector ? $(source.nextPageSelector).first().attr('href') : undefined;
-      const next = nextHref ? absolute(nextHref, response.url) : '';
-      pageUrl = next && new URL(next).origin === new URL(response.url).origin && next !== pageUrl ? next : '';
+      const movie = parseHtmlMovie(detail.body, source, detail.url, dateRange?.timezone ?? context.settings.timezone);
+      if (!movie) {
+        if (dateRange) throw new Error(`详情页没有匹配片名，无法完成日期范围采集：${safeUrlLabel(detailUrl)}`);
+        context.log('详情页没有匹配片名，已跳过'); continue;
+      }
+      if (dateRange) {
+        const updatedOn = movie.sourceUpdatedOn;
+        if (!updatedOn) throw new Error(`「${movie.title}」没有有效的源站更新时间，无法按日期筛选`);
+        if (updatedOn < dateRange.startDate) {
+          if (source.updatesSortedDescending) { reachedStart = true; break; }
+          continue;
+        }
+        if (updatedOn > dateRange.endDate) continue;
+      }
+      if (visitedMovies.has(movie.externalId)) continue;
+      visitedMovies.add(movie.externalId);
+      const plan = htmlPlan(movie, detail, source);
+      if (dateRange) {
+        // Archive every matching title before long episode/line resolution.
+        await context.onCheckpoint?.(structuredClone(movie));
+        updatePlans.push(plan); count++;
+        context.log(`已发现 ${count} 部日期范围内影片，正在读取影片资料`);
+      } else {
+        yield await populateHtmlResources(plan, client, context); count++;
+      }
     }
-    for (let index = 0; index < updatePlans.length; index++) {
-      context.signal?.throwIfAborted();
-      context.log(`已归档 ${updatePlans.length} 部影片资料，补齐第 ${index + 1}/${updatePlans.length} 部播放资源`);
-      yield await populateHtmlResources(updatePlans[index], client, context);
-    }
+    if (reachedStart) { context.log('已到达开始日期之前的记录，停止翻页'); break; }
+    const nextHref = source.nextPageSelector ? $(source.nextPageSelector).first().attr('href') : undefined;
+    const next = nextHref ? absolute(nextHref, response.url) : '';
+    pageUrl = next && new URL(next).origin === new URL(response.url).origin && next !== pageUrl ? next : '';
+  }
+  for (let index = 0; index < updatePlans.length; index++) {
+    context.signal?.throwIfAborted();
+    context.log(`已归档 ${updatePlans.length} 部影片资料，补齐第 ${index + 1}/${updatePlans.length} 部播放资源`);
+    yield await populateHtmlResources(updatePlans[index], client, context);
   }
   context.log(`本次读取 ${count} 部影片`);
   if (dateRange && incompletePages) throw new Error(`已读取 ${count} 部影片；${incompletePages} 个页面未完整取得内容，详见任务错误，可重新采集补齐`);

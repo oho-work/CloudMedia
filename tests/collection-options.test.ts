@@ -99,16 +99,6 @@ test('all and date scopes conflict while an identical frozen scope reuses the ta
   assert.throws(() => worker.enqueue(source, { mode: 'range', startDate: '2026-11-01', endDate: '2026-11-03' }), (error: unknown) => error instanceof WorkerRequestError && error.status === 409);
 });
 
-test('non-HTML sources accept all but reject date filters with HTTP 400 semantics', async t => {
-  for (const adapter of ['json', 'maccms'] as const) await t.test(adapter, t => {
-    const { source, worker, state } = fixture(t, { adapter, collectionMode: 'all' });
-    for (const request of [{ mode: 'today' }, { mode: 'range', startDate: '2026-11-01', endDate: '2026-11-03' }, { startDate: '2026-11-03' }] as CollectionRequest[])
-      assert.throws(() => worker.enqueue(source, request), (error: unknown) => error instanceof WorkerRequestError && error.status === 400);
-    assert.equal(state.runs.length, 0);
-    assert.equal(worker.enqueue(source, { mode: 'all' }).dateRange, undefined);
-  });
-});
-
 test('the task API accepts each scope on an all source and rejects invalid date requests', async t => {
   const state = initialState();
   const source = sourceDefaults({ id: 'scope-api', name: 'Fixture', baseUrl: 'https://example.invalid', listPath: 'file:///no-network', collectionMode: 'all' });
@@ -142,8 +132,5 @@ test('the task API accepts each scope on an all source and rejects invalid date 
     { mode: 'range', startDate: '2026-11-03', endDate: '2026-11-01' },
     { mode: 'all', startDate: '2026-11-01', endDate: '2026-11-03' }, { mode: 'today', startDate: '2026-11-01' }])
     assert.equal((await post(request)).status, 400, JSON.stringify(request));
-  source.adapter = 'json';
-  assert.equal((await post({ mode: 'today' })).status, 400);
-  assert.equal((await post({ mode: 'range', startDate: '2026-11-01', endDate: '2026-11-03' })).status, 400);
   assert.equal(state.runs.length, beforeInvalid);
 });

@@ -1,4 +1,4 @@
-export type Adapter = 'maccms' | 'html' | 'json';
+export type Adapter = 'html';
 export type CollectionMode = 'today' | 'all' | 'range';
 export interface CollectionRequest { mode?: CollectionMode; startDate?: string; endDate?: string }
 export interface DateRange { startDate: string; endDate: string; timezone: string }
@@ -6,7 +6,6 @@ export interface Source {
   id: string; name: string; baseUrl: string; adapter: Adapter; enabled: boolean;
   listPath: string; detailLinkSelector: string; titleSelector: string; posterSelector: string;
   descriptionSelector: string; resourceSelector: string; nextPageSelector: string;
-  jsonItemsPath: string; jsonTitleField: string; jsonUrlField: string;
   requestIntervalMs: number; maxPages: number; maxItems: number; maxResourcePages: number; respectRobots: boolean;
   referer: string; createdAt: string; lastRunAt: string | null; lastError: string | null;
   collectionMode?: CollectionMode | 'updates'; updatesSortedDescending?: boolean;

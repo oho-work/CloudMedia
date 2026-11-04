@@ -4,11 +4,30 @@ import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import test from 'node:test';
+import test, { type TestContext } from 'node:test';
 import { PosterArchiver } from '../server/poster-archive.js';
 import { upsertMovie } from '../server/catalog.js';
 import { sourceDefaults } from '../server/defaults.js';
 import { Store } from '../server/store.js';
+
+async function withoutTimerAdvance(t: TestContext, run: (signal: AbortSignal) => Promise<void>) {
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  const controller = new AbortController();
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1793750400000 });
+  const task = run(controller.signal);
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([task, new Promise<never>((_resolve, reject) => {
+      watchdog = realSetTimeout(() => reject(new Error('zero poster interval must not wait for timer advancement')), 2000);
+    })]);
+  } finally {
+    realClearTimeout(watchdog);
+    controller.abort();
+    await task.catch(() => {});
+    t.mock.timers.reset();
+  }
+}
 
 test('poster archive persists local files, failures and recovered legacy images', async t => {
   const keys = ['DATABASE_URL', 'DATA_FILE', 'POSTER_DIR', 'ALLOW_PRIVATE_UPSTREAM'] as const;
@@ -23,7 +42,7 @@ test('poster archive persists local files, failures and recovered legacy images'
   const requestTimes: { url: string; at: number }[] = [];
   const upstream = createServer((request, response) => {
     requests.push(request.url || '');
-    requestTimes.push({ url: request.url || '', at: Date.now() });
+    requestTimes.push({ url: request.url || '', at: performance.now() });
     if (request.url === '/redirect.png') { response.writeHead(302, { location: origin + '/poster.png' }); response.end(); return; }
     if (request.url === '/slow.png') { releaseSlow = () => { response.setHeader('content-type', 'image/png'); response.end(png); }; return; }
     if (request.url === '/slow-detail') { releaseDetail = () => response.end('<h1>旧详情</h1><img class="cover" src="/poster.png">'); return; }
@@ -31,12 +50,13 @@ test('poster archive persists local files, failures and recovered legacy images'
       response.setHeader('content-type', 'image/png'); response.end(png); return;
     }
     if (request.url === '/detail') { response.end('<h1>旧电影</h1><img class="cover" src="/poster.png">'); return; }
+    if (request.url === '/no-poster-detail') { response.end('<h1>没有海报的电影</h1>'); return; }
     response.writeHead(503); response.end('temporarily unavailable');
   });
   await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve));
   origin = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`;
   const store = new Store(); await store.init();
-  const source = sourceDefaults({ baseUrl: origin, posterSelector: '.cover', respectRobots: false }); store.state.sources = [source];
+  const source = sourceDefaults({ baseUrl: origin, posterSelector: '.cover', respectRobots: false, requestIntervalMs: 0 }); store.state.sources = [source];
   const archiver = new PosterArchiver(store);
   const movie = (id: string, poster: string) => upsertMovie(store.state, source, { externalId: id, pageUrl: origin + '/detail', title: id, poster, resources: [] }).movie;
   t.after(async () => {
@@ -122,12 +142,60 @@ test('poster archive persists local files, failures and recovered legacy images'
     await writeFile(filename, png); await archiver.archiveMovie(item);
     assert.equal(item.poster, savedPath);
   });
-  await t.test('redirected image requests retain the per-host request interval', async () => {
-    const item = movie('redirect', origin + '/redirect.png'); const start = requestTimes.length;
+  await t.test('zero source interval downloads images and redirects without advancing timer time', async t => {
+    const zeroArchiver = new PosterArchiver(store);
+    const unrelated = sourceDefaults({ baseUrl: 'https://other-zero.fixture.example', requestIntervalMs: 1000 });
+    const cdnSource = sourceDefaults({ baseUrl: 'https://zero-catalog.fixture.example', requestIntervalMs: 0 });
+    store.state.sources.push(unrelated, cdnSource);
+    const detailPage = cdnSource.baseUrl + '/detail';
+    try {
+      await withoutTimerAdvance(t, async signal => {
+        for (const id of ['zero-redirect-first', 'zero-redirect-second']) {
+          const item = upsertMovie(store.state, cdnSource, { externalId: id, pageUrl: detailPage, title: id, poster: origin + '/redirect.png', resources: [] }).movie;
+          item.sourceRefs.unshift({ sourceId: unrelated.id, externalId: id, pageUrl: unrelated.baseUrl + '/detail' });
+          await zeroArchiver.archiveMovie(item, '', detailPage, signal);
+          assert.equal(item.posterArchive?.status, 'saved');
+        }
+      });
+    } finally { await zeroArchiver.stop(); }
+  });
+  await t.test('zero source interval recovers repeated legacy pages without advancing timer time', async t => {
+    const zeroArchiver = new PosterArchiver(store);
+    const start = requests.length;
+    try {
+      await withoutTimerAdvance(t, async signal => {
+        for (const digit of ['6', '7', '8', '9']) {
+          const item = movie('zero-recovery-' + digit, '/media/posters/' + digit.repeat(64) + '.png');
+          item.sourceRefs[0].pageUrl = origin + '/no-poster-detail';
+          await zeroArchiver.archiveMovie(item, '', '', signal);
+          assert.equal(item.posterArchive?.status, 'missing');
+        }
+      });
+      assert.deepEqual(requests.slice(start), ['/no-poster-detail', '/no-poster-detail', '/no-poster-detail', '/no-poster-detail']);
+    } finally { await zeroArchiver.stop(); }
+  });
+  await t.test('redirected CDN image requests use the interval of their recorded source', async () => {
+    const unrelated = sourceDefaults({ baseUrl: 'https://other-catalog.fixture.example', requestIntervalMs: 1000 });
+    const cdnSource = sourceDefaults({ baseUrl: 'https://catalog.fixture.example', requestIntervalMs: 300 });
+    store.state.sources.push(unrelated, cdnSource);
+    const detailPage = cdnSource.baseUrl + '/detail';
+    const item = upsertMovie(store.state, cdnSource, { externalId: 'redirect', pageUrl: detailPage, title: 'CDN poster', poster: origin + '/redirect.png', resources: [] }).movie;
+    item.sourceRefs.unshift({ sourceId: unrelated.id, externalId: 'unrelated', pageUrl: unrelated.baseUrl + '/detail' });
+    const start = requestTimes.length;
+    await archiver.archiveMovie(item, '', detailPage);
+    const attempts = requestTimes.slice(start);
+    assert.deepEqual(attempts.map(entry => entry.url), ['/redirect.png', '/poster.png']);
+    const elapsed = attempts[1].at - attempts[0].at;
+    assert.ok(elapsed >= 250, 'the redirect target must retain its source interval');
+    assert.equal(item.posterArchive?.status, 'saved');
+  });
+  await t.test('image redirects retain the fallback interval when their source is no longer available', async () => {
+    const item = movie('orphan-redirect', origin + '/redirect.png'); item.sourceRefs = [];
+    const start = requestTimes.length;
     await archiver.archiveMovie(item);
     const attempts = requestTimes.slice(start);
     assert.deepEqual(attempts.map(entry => entry.url), ['/redirect.png', '/poster.png']);
-    assert.ok(attempts[1].at - attempts[0].at >= 950, 'the redirect target must be rate limited as well');
+    assert.ok(attempts[1].at - attempts[0].at >= 950, 'an orphaned image retains the fallback one-second interval');
     assert.equal(item.posterArchive?.status, 'saved');
   });
   await t.test('a stale detail recovery cannot overwrite newer checkpoint poster provenance', async () => {

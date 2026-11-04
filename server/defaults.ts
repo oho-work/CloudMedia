@@ -11,18 +11,20 @@ export const emptyProbe = (): ProbeResult => ({ status: 'pending', checkedAt: nu
   width: null, height: null, bandwidth: null, speedMbps: null, latencyMs: null,
   bytesRead: 0, durationMs: 0, sampledSegments: 0, playlistUrl: null, error: null });
 export function sourceDefaults(input: Partial<Source> = {}): Source {
+  const normalized = { ...input } as Partial<Source> & Record<string, unknown>;
+  delete normalized.jsonItemsPath; delete normalized.jsonTitleField; delete normalized.jsonUrlField;
   // Recognize the bundled update feed on load as well as on first setup, so an
   // existing installation gains today's scope without changing its source ID.
-  const bundledUpdates = input.adapter !== 'json' && input.adapter !== 'maccms' && /^555\s*影视$/.test(input.name || '') && input.listPath === '/label/new.html';
-  return { id: randomUUID(), name: '', baseUrl: '', adapter: 'html', enabled: true,
+  const bundledUpdates = /^555\s*影视$/.test(input.name || '') && input.listPath === '/label/new.html';
+  return { id: randomUUID(), name: '', baseUrl: '', enabled: true,
     listPath: '/', detailLinkSelector: 'a[href*="/voddetail/"]', titleSelector: 'h1',
     posterSelector: '.module-item-pic img, .vodlist_thumb img', descriptionSelector: '.module-info-introduction, .vod_content',
     resourceSelector: 'a[href*="/vodplay/"], a[href$=".m3u8"]', nextPageSelector: 'a[title="下一页"]',
-    jsonItemsPath: 'list', jsonTitleField: 'vod_name', jsonUrlField: 'vod_play_url',
     requestIntervalMs: 2500,
     createdAt: new Date().toISOString(), lastRunAt: null, lastError: null,
     updatesSortedDescending: bundledUpdates,
-    ...input,
+    ...normalized,
+    adapter: 'html',
     collectionMode: input.collectionMode === 'updates' ? 'today' : input.collectionMode || (bundledUpdates ? 'today' : 'all'),
     maxPages: 0, maxItems: 0, maxResourcePages: 0, respectRobots: false, referer: '',
     ...(bundledUpdates && input.detailLinkSelector === 'a[href*="/voddetail/"]' ? { detailLinkSelector: '.module-poster-item[href*="/voddetail/"]' } : {}),

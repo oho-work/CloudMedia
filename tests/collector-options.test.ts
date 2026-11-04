@@ -12,10 +12,10 @@ import type { CollectedMovie } from '../shared/types.js';
 
 let origin = '';
 let previousPrivate: string | undefined;
-const requests: { path: string; referer: string | undefined }[] = [];
+const requests: { path: string; referer: string | undefined; receivedAt: number }[] = [];
 const server = createServer((request, response) => {
   const url = new URL(request.url!, 'http://localhost');
-  requests.push({ path: url.pathname, referer: request.headers.referer });
+  requests.push({ path: url.pathname, referer: request.headers.referer, receivedAt: performance.now() });
   if (url.pathname === '/robots.txt') { response.end('User-agent: *\nDisallow: /\nCrawl-delay: 60'); return; }
   if (url.pathname === '/refresh-list') { response.end('<a href="/voddetail/refresh">Refresh movie</a>'); return; }
   if (url.pathname === '/list/1' || url.pathname === '/list/2') {
@@ -43,10 +43,6 @@ const server = createServer((request, response) => {
   if (url.pathname.startsWith('/vodplay/') || url.pathname === '/redirected-play') {
     response.end(`<video src="${origin}/stream/${url.pathname.slice(1)}.m3u8"></video>`); return;
   }
-  if (url.pathname === '/json') {
-    const page = Number(url.searchParams.get('pg') || url.searchParams.get('page') || 1);
-    response.end(JSON.stringify({ pagecount: 2, list: [page * 2 - 1, page * 2].map(id => ({ vod_id: id, vod_name: `Movie ${id}` })) })); return;
-  }
   if (url.pathname === '/dated-list') { response.end('<a href="/voddetail/dated-today">today</a><a href="/voddetail/dated-old">old</a>'); return; }
   response.writeHead(404); response.end();
 });
@@ -62,9 +58,49 @@ after(async () => {
   if (previousPrivate === undefined) delete process.env.ALLOW_PRIVATE_UPSTREAM; else process.env.ALLOW_PRIVATE_UPSTREAM = previousPrivate;
 });
 
-const source = () => ({ ...sourceDefaults({ baseUrl: origin, listPath: '/list/1', requestIntervalMs: 500 }),
+const source = () => ({ ...sourceDefaults({ baseUrl: origin, listPath: '/list/1', requestIntervalMs: 0 }),
   maxPages: 1, maxItems: 1, maxResourcePages: 1, respectRobots: false, referer: 'https://manual.example/unused' });
 const context = () => ({ settings: { ...defaultSettings, maxRetries: 0 }, log: (_message: string) => {} });
+
+test('zero request interval completes real HTML requests without advancing the timer clock', async t => {
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  const controller = new AbortController();
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1793750400000 });
+  requests.length = 0;
+  const collection = (async () => {
+    const movies: CollectedMovie[] = [];
+    for await (const movie of collectSource({ ...source(), requestIntervalMs: 0 }, { ...context(), signal: controller.signal })) movies.push(movie);
+    return movies;
+  })();
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const movies = await Promise.race([collection, new Promise<never>((_resolve, reject) => {
+      watchdog = realSetTimeout(() => reject(new Error('zero interval must not wait for timer advancement')), 2000);
+    })]);
+    assert.equal(movies.length, 4);
+    assert.deepEqual(movies.map(movie => movie.resources.length), [2, 2, 2, 2]);
+    assert.ok(requests.some(request => request.path === '/redirected-play'));
+    assert.ok(requests.some(request => request.path === '/list/2'));
+  } finally {
+    realClearTimeout(watchdog);
+    controller.abort();
+    await collection.catch(() => {});
+    t.mock.timers.reset();
+  }
+});
+
+test('positive request intervals continue spacing real listing, detail and playback requests', async () => {
+  requests.length = 0;
+  const movies: CollectedMovie[] = [];
+  for await (const movie of collectSource({ ...source(), listPath: '/refresh-list', requestIntervalMs: 300 }, context())) movies.push(movie);
+  assert.equal(movies[0].resources.length, 1);
+  const collectionRequests = requests.filter(request => ['/refresh-list', '/voddetail/refresh', '/vodplay/refresh'].includes(request.path));
+  assert.equal(collectionRequests.length, 3);
+  for (let index = 1; index < collectionRequests.length; index++) {
+    assert.ok(collectionRequests[index].receivedAt - collectionRequests[index - 1].receivedAt >= 250, 'configured positive spacing must be preserved');
+  }
+});
 
 test('legacy positive limits do not cap HTML list pages, films or per-film playback pages', async () => {
   const movies: CollectedMovie[] = [];
@@ -128,15 +164,6 @@ test('refresh without a saved detail page falls back to the source entry', async
   assert.equal(refreshed.probe.status, 'ok', refreshed.probe.error || 'legacy refresh must succeed');
   assert.equal(requests.find(request => request.path === '/vodplay/root')?.referer, origin + '/');
 });
-
-for (const adapter of ['maccms', 'json'] as const) {
-  test(`legacy positive limits do not cap ${adapter} pages or titles`, async () => {
-    const movies: CollectedMovie[] = [];
-    for await (const movie of collectSource({ ...source(), adapter, listPath: '/json' }, context())) movies.push(movie);
-    assert.equal(movies.length, 4);
-    assert.equal(new Set(movies.map(movie => movie.externalId)).size, 4);
-  });
-}
 
 test('direct today collection filters today and ignores saved range dates', async () => {
   const movies: CollectedMovie[] = [];

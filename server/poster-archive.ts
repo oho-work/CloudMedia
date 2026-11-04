@@ -81,7 +81,7 @@ export class PosterArchiver {
     void task.then(() => this.pending.delete(movie.id), () => this.pending.delete(movie.id));
     return task;
   }
-  private async throttle(url: string, signal: AbortSignal, interval = 1000) {
+  private async throttle(url: string, signal: AbortSignal, interval: number) {
     const host = new URL(url).host;
     const wait = Math.max(0, interval - (Date.now() - (this.lastRequests.get(host) || 0)));
     if (wait) await delay(wait, undefined, { signal });
@@ -91,9 +91,9 @@ export class PosterArchiver {
     let failure: unknown;
     for (const reference of movie.sourceRefs) {
       const source = this.store.state.sources.find(item => item.id === reference.sourceId);
-      if (!source || source.adapter !== 'html') continue;
+      if (!source) continue;
       try {
-        await this.throttle(reference.pageUrl, signal, Math.max(1000, source.requestIntervalMs));
+        await this.throttle(reference.pageUrl, signal, Math.max(0, source.requestIntervalMs));
         const recovered = await resolvePosterPage(source, reference.pageUrl, { settings: this.store.state.settings, signal, log: () => {} });
         if (remote(recovered)) return { url: recovered, referer: reference.pageUrl };
       } catch (error) { signal.throwIfAborted(); failure = error; }
@@ -130,7 +130,10 @@ export class PosterArchiver {
         archive.status = 'missing'; archive.error = '原图片文件缺失，且没有可恢复的原图地址；请恢复图片备份或重新采集。';
         archive.nextRetryAt = new Date(Date.now() + 86400000).toISOString();
       } else {
-        const file = await archivePoster(archive.originalUrl, archive.referer, this.store.state.settings, signal, target => this.throttle(target.href, signal));
+        const source = this.store.state.sources.find(item => movie.sourceRefs.some(reference => reference.sourceId === item.id && reference.pageUrl === archive.referer))
+          || movie.sourceRefs.map(reference => this.store.state.sources.find(item => item.id === reference.sourceId)).find(Boolean);
+        const interval = source ? Math.max(0, source.requestIntervalMs) : 1000;
+        const file = await archivePoster(archive.originalUrl, archive.referer, this.store.state.settings, signal, target => this.throttle(target.href, signal, interval));
         if (movie.posterArchive !== archive) return;
         movie.poster = file.path;
         Object.assign(archive, file, { status: 'saved', error: null, nextRetryAt: null });
