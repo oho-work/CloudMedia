@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, unlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -7,8 +7,9 @@ import path from 'node:path';
 import test, { type TestContext } from 'node:test';
 import { PosterArchiver } from '../server/poster-archive.js';
 import { upsertMovie } from '../server/catalog.js';
-import { sourceDefaults } from '../server/defaults.js';
+import { initialState, sourceDefaults } from '../server/defaults.js';
 import { Store } from '../server/store.js';
+import type { PosterBinary, PosterStorage } from '../server/poster-storage.js';
 
 async function withoutTimerAdvance(t: TestContext, run: (signal: AbortSignal) => Promise<void>) {
   const realSetTimeout = globalThis.setTimeout;
@@ -207,4 +208,51 @@ test('poster archive persists local files, failures and recovered legacy images'
     assert.equal(item.posterArchive?.originalUrl, origin + '/poster.png?new');
     assert.equal(item.posterArchive?.referer, origin + '/new-detail');
   });
+});
+
+test('database-mode archiver stores and reuses binary posters without creating a local image directory', async t => {
+  const previous = { POSTER_DIR: process.env.POSTER_DIR, ALLOW_PRIVATE_UPSTREAM: process.env.ALLOW_PRIVATE_UPSTREAM };
+  const directory = await mkdtemp(path.join(tmpdir(), 'cloudmedia-database-posters-'));
+  const unusedPosters = path.join(directory, 'must-not-be-created');
+  process.env.POSTER_DIR = unusedPosters; process.env.ALLOW_PRIVATE_UPSTREAM = 'true';
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aD1kAAAAASUVORK5CYII=', 'base64');
+  const upstream = createServer((_request, response) => { response.setHeader('content-type', 'image/png'); response.end(png); });
+  await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}`;
+  const images = new Map<string, PosterBinary>();
+  let failWrite = false, writes = 0, snapshots = 0;
+  const posterStorage: PosterStorage = {
+    async get(key) { return images.get(key) || null; },
+    async put(value) { if (failWrite) throw new Error('database write failed'); writes++; images.set(value.path, value); },
+  };
+  const state = initialState();
+  const source = sourceDefaults({ baseUrl: origin, requestIntervalMs: 0, respectRobots: false }); state.sources = [source];
+  const store = { state, posterStorage, async save() { snapshots++; } } as unknown as Store;
+  const archiver = new PosterArchiver(store);
+  t.after(async () => {
+    await archiver.stop();
+    if (upstream.listening) await new Promise<void>(resolve => upstream.close(() => resolve()));
+    for (const [key, value] of Object.entries(previous)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+    await rm(directory, { recursive: true, force: true });
+  });
+  const movie = upsertMovie(state, source, { externalId: 'database', pageUrl: origin + '/detail', title: '数据库海报', poster: origin + '/poster.png', resources: [] }).movie;
+  await archiver.archiveMovie(movie);
+  assert.equal(movie.posterArchive?.status, 'saved');
+  assert.deepEqual(images.get(movie.poster)?.data, png);
+  assert.equal(writes, 1); assert.ok(snapshots >= 2);
+  await assert.rejects(readdir(unusedPosters), { code: 'ENOENT' });
+
+  images.clear(); failWrite = true;
+  const failed = upsertMovie(state, source, { externalId: 'failed', pageUrl: origin + '/detail', title: '数据库写入失败', poster: origin + '/other.png', resources: [] }).movie;
+  await archiver.archiveMovie(failed);
+  assert.equal(failed.posterArchive?.status, 'error'); assert.match(failed.posterArchive?.error || '', /database write failed/);
+  assert.equal(failed.poster, '');
+  await assert.rejects(readdir(unusedPosters), { code: 'ENOENT' });
+
+  failWrite = false;
+  await archiver.archiveMovie(movie, '', '', undefined, true);
+  await new Promise<void>(resolve => upstream.close(() => resolve()));
+  await archiver.archiveMovie(movie);
+  assert.equal(movie.posterArchive?.status, 'saved'); assert.deepEqual(images.get(movie.poster)?.data, png);
+  await assert.rejects(readdir(unusedPosters), { code: 'ENOENT' });
 });

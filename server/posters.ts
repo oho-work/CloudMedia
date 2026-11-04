@@ -3,6 +3,7 @@ import { lstat, mkdir, open, rename, stat, unlink, writeFile } from 'node:fs/pro
 import path from 'node:path';
 import type { Settings } from '../shared/types.js';
 import { safeFetch } from './upstream.js';
+import type { PosterBinary, PosterStorage } from './poster-storage.js';
 
 export interface PosterFile {
   path: string; sha256: string; mime: string; bytes: number; downloadedAt: string;
@@ -168,10 +169,25 @@ function detectMime(bytes: Buffer): string | null {
   return null;
 }
 
-/** Validate a permanent local poster without contacting its former upstream. */
-export async function inspectPoster(localPath: string): Promise<PosterFile | null> {
+/** Validate archived bytes before returning their metadata or serving them. */
+export function inspectPosterBinary(value: PosterBinary): PosterFile | null {
+  const match = localPattern.exec(value.path);
+  if (!match || !Buffer.isBuffer(value.data) || value.data.length <= 0 || value.data.length > maxBytes) return null;
+  const mime = detectMime(value.data);
+  if (!mime || mime !== value.mime || formats[mime] !== match[2] || !Number.isFinite(Date.parse(value.downloadedAt))) return null;
+  const sha256 = createHash('sha256').update(value.data).digest('hex');
+  if (value.sha256 !== sha256) return null;
+  return { path: value.path, sha256, mime, bytes: value.data.length, downloadedAt: value.downloadedAt };
+}
+
+/** Validate an archived poster without contacting its former upstream. */
+export async function inspectPoster(localPath: string, storage?: PosterStorage): Promise<PosterFile | null> {
   const match = localPattern.exec(localPath);
   if (!match) return null;
+  if (storage) {
+    const stored = await storage.get(localPath);
+    return stored?.path === localPath ? inspectPosterBinary(stored) : null;
+  }
   const filename = path.join(posterDirectory(), `${match[1]}.${match[2]}`);
   try {
     const info = await lstat(filename);
@@ -199,11 +215,11 @@ export async function inspectPoster(localPath: string): Promise<PosterFile | nul
 
 /** Download a bounded, signature-checked image into permanent content-addressed storage. */
 export async function archivePoster(url: string, referer: string, settings: Settings, signal?: AbortSignal,
-  beforeRequest?: (url: URL) => Promise<void>): Promise<PosterFile> {
+  beforeRequest?: (url: URL) => Promise<void>, storage?: PosterStorage): Promise<PosterFile> {
   signal?.throwIfAborted();
   if (url.startsWith('/media/posters/')) {
-    const existing = await inspectPoster(url);
-    if (!existing) throw new Error('本地海报不存在或文件无效');
+    const existing = await inspectPoster(url, storage);
+    if (!existing) throw new Error('已归档海报不存在或内容无效');
     return existing;
   }
   const downloadSignal = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(10000)]);
@@ -236,8 +252,13 @@ export async function archivePoster(url: string, referer: string, settings: Sett
   const sha256 = createHash('sha256').update(bytes).digest('hex');
   const filename = `${sha256}.${formats[mime]}`;
   const localPath = `/media/posters/${filename}`;
-  const existing = await inspectPoster(localPath);
+  const existing = await inspectPoster(localPath, storage);
   if (existing?.sha256 === sha256) return existing;
+  if (storage) {
+    const downloadedAt = new Date().toISOString();
+    await storage.put({ path: localPath, sha256, mime, data: bytes, downloadedAt });
+    return { path: localPath, sha256, mime, bytes: bytes.length, downloadedAt };
+  }
   const folder = posterDirectory();
   await mkdir(folder, { recursive: true });
   const temporary = path.join(folder, `.${randomUUID()}.tmp`);
@@ -251,6 +272,6 @@ export async function archivePoster(url: string, referer: string, settings: Sett
 }
 
 /** Compatibility wrapper: failures reject so callers can never expose remote fallback URLs. */
-export async function cachePoster(url: string, referer: string, settings: Settings): Promise<string> {
-  return (await archivePoster(url, referer, settings)).path;
+export async function cachePoster(url: string, referer: string, settings: Settings, storage?: PosterStorage): Promise<string> {
+  return (await archivePoster(url, referer, settings, undefined, undefined, storage)).path;
 }

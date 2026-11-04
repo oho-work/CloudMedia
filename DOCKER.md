@@ -1,10 +1,10 @@
 # Docker 部署
 
-提供 Node.js 24 多阶段镜像和 Docker Compose 配置。镜像构建前端及服务端，运行时使用普通用户；数据库资料和海报通过持久卷保存，容器重建后继续保留。
+提供 Node.js 24 多阶段镜像和 Docker Compose 配置。镜像构建前端及服务端，运行时使用普通用户；影视资料、任务、设置和海报二进制统一保存在 PostgreSQL，应用容器重建后继续保留。
 
-图片保存为 `/app/data/posters` 下的普通文件，图片二进制不存入 PostgreSQL。默认 `app-data` 卷包含这些永久图片；不要用容器临时文件层保存海报，也不要在未备份时删除该卷。迁移/恢复必须同时处理 PostgreSQL 和图片卷。页面不回退源站图片，后台补存及失败重试进度可在“系统设置”的“图片永久归档”查看。
+图片保存在 PostgreSQL 的 `poster_files` 表，页面通过 `/media/posters/...` 接口从数据库读取。应用不创建本地图片、JSON 数据或备份文件，不需要应用数据卷。页面不回退源站图片，后台补存及失败重试进度可在“系统设置”的“图片永久归档”查看。
 
-需要 Docker Engine 或 Docker Desktop（Linux 容器模式）以及 Docker Compose v2。以下命令均在项目根目录运行。示例使用 PowerShell；Linux/macOS 将 `Copy-Item` 换成 `cp`，创建备份目录时将 `New-Item -ItemType Directory -Force backup` 换成 `mkdir -p backup`。
+需要 Docker Engine 或 Docker Desktop（Linux 容器模式）以及 Docker Compose v2。以下命令均在项目根目录运行。示例使用 PowerShell；Linux/macOS 将 `Copy-Item` 换成 `cp`。
 
 尚未获取源码时，先按 [README 中的步骤](README.md#环境与启动) 克隆 `git@github.com:oho-work/CloudMedia.git` 的 `dev` 分支。镜像仅包含构建后的应用，不包含个人 `.env`、本地采集数据或海报；已有部署的数据迁移步骤见下文。
 
@@ -47,13 +47,7 @@ docker compose --env-file .env.docker build
 
 实际切换到 Docker 前，等待或取消当前采集，并停止原来的 CloudMedia 服务，释放端口和数据库 schema 锁。同一个 schema 只允许一个实例运行；仅更换 HTTP 端口仍无法同时访问同一个 schema。
 
-如需保留本机已经缓存的海报，在首次启动前导入应用数据卷：
-
-```powershell
-docker compose --env-file .env.docker run --rm --no-deps --user root --volume ./data:/import:ro --entrypoint sh app -c 'mkdir -p /app/data/posters && cp -a /import/posters/. /app/data/posters/ && chown -R node:node /app/data'
-```
-
-该命令适用于已有 `data/posters` 目录；如果原来设置了 `POSTER_DIR`，将挂载位置改为实际目录并相应调整 `/import/posters`。连接相同数据库和 schema 时，影片、播放地址及设置会直接继续使用，无须重复导入数据库。已有 `/media/posters/...` 引用需要对应的海报文件。
+连接相同数据库和 schema 时，影片、播放地址、设置及已经入库的图片直接继续使用。旧版部署中的 `data/posters` 不再作为图片读取来源；升级前应将仍需保留的图片直接导入 `poster_files` 并核验，不要通过复制到容器磁盘代替入库。缺失的数据库图片会按已保存原图地址或详情页重新归档。
 
 ```powershell
 docker compose --env-file .env.docker up -d
@@ -90,16 +84,15 @@ docker compose --env-file .env.docker -f compose.yaml -f compose.postgres.yaml p
 
 这是一个新的数据库，不会自动迁移原外部数据库或 JSON 文件中的数据。`POSTGRES_*` 变量只在数据库卷首次初始化时生效；已有数据卷时修改环境文件不会重置账号或密码。更换 PostgreSQL 大版本前应按其升级流程操作。
 
-## 持久化、更新与备份
+## 持久化与更新
 
-默认 Compose 项目名为 `cloudmedia`：
+默认 Compose 项目名为 `cloudmedia`，应用服务不挂载任何数据卷：
 
 | 持久卷 | 保存内容 |
 | --- | --- |
-| `cloudmedia_app-data` | `/app/data`，包括本地海报。 |
 | `cloudmedia_postgres-data` | 可选 PostgreSQL 服务的数据目录。 |
 
-应用数据保存在 PostgreSQL 的 `PGSCHEMA` 中，默认 `cloudmedia`。Compose 配置要求提供数据库连接，不会意外进入 JSON 预览模式。容器内必须监听 `0.0.0.0`，因此即使只向宿主机回环地址发布端口，也需要填写 `APP_AUTH_TOKEN`。
+应用数据保存在 PostgreSQL 的 `PGSCHEMA` 中，默认 `cloudmedia`，包含资料用的五张 JSONB 表及图片用的 `poster_files` 表。使用外部 PostgreSQL 时不会创建应用数据卷；可选的 `postgres-data` 是数据库服务自身的数据盘。Compose 配置要求提供数据库连接，不会意外进入 JSON 预览模式，数据库故障也不会回退磁盘。容器内必须监听 `0.0.0.0`，因此即使只向宿主机回环地址发布端口，也需要填写 `APP_AUTH_TOKEN`。
 
 更新代码后，在采集结束或取消后执行：
 
@@ -109,21 +102,7 @@ docker compose --env-file .env.docker up -d --build
 
 使用附带数据库时，仍需加上两个 `-f` 参数。更新会重建应用容器并中断正在进行的采集，已保存的数据保留。容器收到停止信号后会尝试保存检查点；重启不会自动续接某个历史任务，请在“采集源”重新选择原日期区间。未过期的播放地址缓存会复用。每日定时采集需要容器持续运行，`restart: unless-stopped` 会在 Docker 服务恢复后重启容器；手动停止的容器需要手动启动。
 
-备份应同时包含数据库和海报卷。外部数据库可使用现有 PostgreSQL 备份流程。附带数据库可这样导出（先创建本地备份目录）：
-
-```powershell
-New-Item -ItemType Directory -Force backup
-docker compose --env-file .env.docker -f compose.yaml -f compose.postgres.yaml exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc -f /tmp/cloudmedia.dump'
-docker compose --env-file .env.docker -f compose.yaml -f compose.postgres.yaml cp postgres:/tmp/cloudmedia.dump ./backup/cloudmedia.dump
-```
-
-海报卷可通过只读挂载导出；以下命令适用于默认项目名，先等待或取消采集以获得一致的备份：
-
-```powershell
-docker run --rm --mount type=volume,source=cloudmedia_app-data,target=/data,readonly --mount "type=bind,source=${PWD}/backup,target=/backup" alpine:3.22 tar -czf /backup/cloudmedia-app-data.tar.gz -C /data .
-```
-
-单独妥善保存 `.env.docker`。`docker compose down` 会删除容器及项目网络，保留持久卷；**不要对需要保留数据的部署执行 `down -v`**，它会删除项目持久卷。恢复已有数据库前先停止应用并备份目标库，按 PostgreSQL 恢复流程导入，再恢复海报文件及其读写权限。
+应用不自动创建本地备份。迁移数据时按数据库管理员的流程处理完整 schema，包含 `poster_files`，无需迁移应用机器的图片目录。单独妥善保存 `.env.docker`。`docker compose down` 会删除容器及项目网络，保留数据库持久卷；**不要对需要保留数据的附带数据库执行 `down -v`**，它会删除 PostgreSQL 数据卷。
 
 ## 采集与访问
 
@@ -137,8 +116,8 @@ docker run --rm --mount type=volume,source=cloudmedia_app-data,target=/data,read
 - **端口占用**：先停止原服务，或修改 `HTTP_PORT`。使用同一数据库 schema 时仍需停止旧实例。
 - **数据库拒绝连接**：检查容器可达的地址、PostgreSQL 监听和访问规则、大小写敏感的用户名及密码 URL 编码；连接失败会停止启动，不会切换到文件模式。
 - **schema 已有实例**：确认原本机或其他容器实例已经退出；不要通过更换 schema 来误以为空库是数据丢失。
-- **写入目录失败**：默认使用命名卷。自行改为宿主机目录挂载时，需要给镜像的 `node` 用户（UID/GID 1000）写权限。
-- **重建后海报丢失**：检查是否保留了 `cloudmedia_app-data`，以及是否导入原 `data/posters`。
+- **海报写入失败**：检查 PostgreSQL 连接、`poster_files` 权限和数据库容量；不会改写本地文件作为回退。
+- **重建后海报丢失**：检查连接的数据库和 schema 是否一致，以及 `poster_files` 是否完整；旧图片目录不参与数据库模式读取。
 - **采集因访问受限停止**：在任务记录检查 401/403、验证码或超时错误；已保存数据保留，访问恢复后可重新采集原区间。
 
 健康检查为 `GET /api/health`，不需要令牌。`docker compose ps` 可查看容器健康状态；健康检查失败本身不会触发 Docker 自动重启，需结合日志检查数据库及服务状态。

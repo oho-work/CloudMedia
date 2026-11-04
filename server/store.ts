@@ -3,6 +3,7 @@ import path from 'node:path';
 import pg from 'pg';
 import type { State } from '../shared/types.js';
 import { initialState, sourceDefaults } from './defaults.js';
+import { PostgresPosterStorage, posterTableSql, type PosterStorage } from './poster-storage.js';
 
 type Table = 'sources' | 'movies' | 'resources' | 'runs';
 const tables: Table[] = ['sources', 'movies', 'resources', 'runs'];
@@ -16,6 +17,7 @@ export class Store {
   state: State = initialState();
   readonly mode: 'postgres' | 'file';
   private pool?: pg.Pool;
+  private posters?: PosterStorage;
   private schema: string;
   private file: string;
   private tail: Promise<unknown> = Promise.resolve();
@@ -24,6 +26,7 @@ export class Store {
   private failure?: Error;
   onFatal?: () => void;
   get healthy() { return !this.failure; }
+  get posterStorage(): PosterStorage | undefined { return this.posters; }
   constructor() {
     this.mode = process.env.DATABASE_URL ? 'postgres' : 'file';
     this.schema = process.env.PGSCHEMA || 'cloudmedia';
@@ -33,6 +36,7 @@ export class Store {
   async init() {
     if (this.mode === 'postgres') {
       this.pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 5, connectionTimeoutMillis: 8000 });
+      this.posters = new PostgresPosterStorage(this.pool, this.schema);
       this.pool.on('error', () => console.error('PostgreSQL 后台连接中断，请检查数据库服务'));
       this.lockClient = await this.pool.connect();
       this.lockClient.on('error', () => {
@@ -47,6 +51,7 @@ export class Store {
       try {
         await client.query('BEGIN');
         await client.query(`CREATE SCHEMA IF NOT EXISTS "${this.schema}"`);
+        await client.query(posterTableSql(this.schema));
         await client.query(`CREATE TABLE IF NOT EXISTS "${this.schema}".settings (id text PRIMARY KEY, data jsonb NOT NULL)`);
         for (const table of tables) {
           await client.query(`CREATE TABLE IF NOT EXISTS "${this.schema}".${table} (id text PRIMARY KEY, data jsonb NOT NULL)`);
@@ -117,5 +122,6 @@ export class Store {
     await this.tail;
     if (this.lockClient) { await this.lockClient.query('SELECT pg_advisory_unlock(hashtext($1))', [`cloudmedia:${this.schema}`]); this.lockClient.release(); this.lockClient = undefined; }
     await this.pool?.end();
+    this.posters = undefined;
   }
 }

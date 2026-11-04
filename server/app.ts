@@ -127,7 +127,20 @@ export function createApp(store: Store, worker: Worker) {
   }));
   app.use('/api/play', playbackRouter(store));
   app.use('/api', (_req, res) => res.status(404).json({ error: '接口不存在' }));
-  app.use('/media/posters', express.static(posterDirectory(), { dotfiles: 'deny', immutable: true, maxAge: '30d' }));
+  if (store.mode === 'postgres') {
+    app.get('/media/posters/:filename', asyncRoute(async (req, res) => {
+      const posterPath = localPosterPath(`/media/posters/${req.params.filename}`);
+      if (!posterPath) { res.status(404).end(); return; }
+      // PostgreSQL deployments never fall back to a stale local image directory.
+      if (!store.healthy || !store.posterStorage) { res.status(503).end(); return; }
+      const poster = await store.posterStorage.get(posterPath);
+      if (!poster) { res.status(404).end(); return; }
+      res.set({ 'Content-Type': poster.mime, 'Cache-Control': 'public, max-age=2592000, immutable', ETag: `"${poster.sha256}"` });
+      res.send(poster.data);
+    }));
+  } else {
+    app.use('/media/posters', express.static(posterDirectory(), { dotfiles: 'deny', immutable: true, maxAge: '30d' }));
+  }
   app.use('/media/posters', (_req, res) => res.status(404).end());
   app.use(express.static(path.resolve('dist'), { index: false }));
   app.get('*', (_req, res) => res.sendFile(path.resolve('dist/index.html'), error => { if (error && !res.headersSent) res.status(503).send('前端尚未构建，请运行 npm run dev 或 npm run build'); }));

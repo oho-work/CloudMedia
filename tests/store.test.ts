@@ -45,6 +45,7 @@ function storedState(): State {
 
 async function loadPostgres(t: TestContext, data: State) {
   const upserts: { table: string; id: string; data: Record<string, unknown> }[] = [];
+  const statements: string[] = [];
   // PostgreSQL JSONB returns object keys by length then byte order, including nested objects.
   const rows: State = JSON.parse(JSON.stringify(data, (_key, value) => {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
@@ -55,6 +56,7 @@ async function loadPostgres(t: TestContext, data: State) {
   const client = {
     on() {}, release() {},
     async query(sql: string, values: unknown[] = []) {
+      statements.push(sql);
       if (sql.startsWith('SELECT pg_try_advisory_lock')) return { rows: [{ locked: true }] };
       const select = sql.match(/^SELECT data FROM "store_test"\.(settings|sources|movies|resources|runs)/);
       if (select) return { rows: select[1] === 'settings' ? [{ data: rows.settings }]
@@ -70,7 +72,7 @@ async function loadPostgres(t: TestContext, data: State) {
       throw new Error(`Unexpected PostgreSQL statement: ${sql}`);
     },
   };
-  const pool = { on() {}, async connect() { return client; }, async end() {} };
+  const pool = { on() {}, async query(sql: string, values: unknown[] = []) { return client.query(sql, values); }, async connect() { return client; }, async end() {} };
   t.mock.method(pg, 'Pool', function () { return pool; } as unknown as typeof pg.Pool);
   const previous = { DATABASE_URL: process.env.DATABASE_URL, PGSCHEMA: process.env.PGSCHEMA };
   process.env.DATABASE_URL = 'postgres://fixture.invalid/cloudmedia';
@@ -85,8 +87,17 @@ async function loadPostgres(t: TestContext, data: State) {
     }
   });
   await store.init();
-  return { store, upserts };
+  return { store, upserts, statements };
 }
+
+test('PostgreSQL startup creates independent bytea poster storage without loading binary rows into catalog state', async t => {
+  const { store, statements } = await loadPostgres(t, storedState());
+  assert.ok(store.posterStorage);
+  assert.equal(statements.filter(sql => sql.startsWith('CREATE TABLE IF NOT EXISTS "store_test".poster_files')).length, 1);
+  assert.ok(statements.some(sql => sql.includes('bytes bytea NOT NULL')));
+  assert.ok(!statements.some(sql => /^SELECT .*FROM "store_test"\.poster_files/.test(sql)));
+  assert.ok(!('poster_files' in store.state));
+});
 
 test('PostgreSQL startup skips UPSERTs for unchanged loaded catalog rows', async t => {
   // Missing startup baselines would rewrite every row, including equal IDs in different tables.

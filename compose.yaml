@@ -18,11 +18,5 @@ services:
       PGSCHEMA: ${PGSCHEMA:-cloudmedia}
       APP_AUTH_TOKEN: ${APP_AUTH_TOKEN:?Set APP_AUTH_TOKEN in .env.docker}
       ALLOW_PRIVATE_UPSTREAM: "false"
-      DATA_FILE: /app/data/cloudmedia.json
-      POSTER_DIR: /app/data/posters
-    volumes:
-      - app-data:/app/data
     extra_hosts:
       - "host.docker.internal:host-gateway"
-volumes:
-  app-data:

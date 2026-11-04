@@ -8,6 +8,7 @@ import path from 'node:path';
 import { after, before, beforeEach, test } from 'node:test';
 import { defaultSettings } from '../server/defaults.js';
 import * as posters from '../server/posters.js';
+import type { PosterBinary, PosterStorage } from '../server/poster-storage.js';
 
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a9ioAAAAASUVORK5CYII=', 'base64');
 const gif = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
@@ -187,5 +188,66 @@ test('cancelling an active download rejects without leaving a partial file', asy
 test('a pre-cancelled download never creates a file', async () => {
   const controller = new AbortController(); controller.abort();
   await assert.rejects(posters.archivePoster(origin + '/png', referer, settings, controller.signal));
+  assert.deepEqual(await readdir(directory), []);
+});
+
+function memoryPosters() {
+  const objects = new Map<string, PosterBinary>();
+  let writes = 0;
+  const storage: PosterStorage = {
+    async get(key) { return objects.get(key) || null; },
+    async put(value) { writes++; objects.set(value.path, { ...value, data: Buffer.from(value.data) }); },
+  };
+  return { storage, objects, get writes() { return writes; } };
+}
+
+test('database poster storage keeps bytes and subsequent inspection in memory without creating a filesystem cache', async () => {
+  const database = memoryPosters();
+  const unusedDirectory = path.join(directory, 'must-not-be-created');
+  const previousDirectory = process.env.POSTER_DIR; process.env.POSTER_DIR = unusedDirectory;
+  try {
+    const saved = await posters.archivePoster(origin + '/png', referer, settings, undefined, undefined, database.storage);
+    assert.deepEqual(database.objects.get(saved.path)?.data, png);
+    assert.deepEqual(await posters.inspectPoster(saved.path, database.storage), saved);
+    assert.equal(await posters.cachePoster(saved.path, referer, settings, database.storage), saved.path);
+    await assert.rejects(readdir(unusedDirectory), { code: 'ENOENT' });
+  } finally { process.env.POSTER_DIR = previousDirectory; }
+});
+
+test('database inspection remains usable after upstream closes and identical content is not rewritten', async () => {
+  const database = memoryPosters();
+  const standalone = createServer((_req, response) => { response.setHeader('content-type', 'image/png'); response.end(png); });
+  await new Promise<void>(resolve => standalone.listen(0, '127.0.0.1', resolve));
+  let saved: posters.PosterFile;
+  try { saved = await posters.archivePoster(`http://127.0.0.1:${(standalone.address() as AddressInfo).port}/image`, referer, settings, undefined, undefined, database.storage); }
+  finally { await new Promise<void>(resolve => standalone.close(() => resolve())); }
+  const duplicate = await posters.archivePoster(origin + '/same-bytes', referer, settings, undefined, undefined, database.storage);
+  assert.deepEqual(duplicate, saved);
+  assert.equal(database.writes, 1);
+  assert.deepEqual(await posters.inspectPoster(saved.path, database.storage), saved);
+  assert.deepEqual(await readdir(directory), []);
+});
+
+test('database failures propagate without writing a local fallback or reusing a local cached file', async () => {
+  await writeFile(path.join(directory, `${sha}.png`), png);
+  const failedRead: PosterStorage = { async get() { throw new Error('database unavailable'); }, async put() { throw new Error('unexpected write'); } };
+  await assert.rejects(posters.inspectPoster(`/media/posters/${sha}.png`, failedRead), /database unavailable/);
+  const failedWrite: PosterStorage = { async get() { return null; }, async put() { throw new Error('database unavailable'); } };
+  await assert.rejects(posters.archivePoster(origin + '/gif', referer, settings, undefined, undefined, failedWrite), /database unavailable/);
+  assert.deepEqual(await readdir(directory), [`${sha}.png`]);
+});
+
+test('database inspection rejects corrupt or mismatched image metadata and keeps legacy names readable', async () => {
+  const database = memoryPosters();
+  const saved = await posters.archivePoster(origin + '/png', referer, settings, undefined, undefined, database.storage);
+  const stored = database.objects.get(saved.path)!;
+  for (const patch of [{ data: Buffer.from('not an image') }, { sha256: '0'.repeat(64) }, { mime: 'image/gif' }, { downloadedAt: 'invalid' }]) {
+    database.objects.set(saved.path, { ...stored, ...patch });
+    assert.equal(await posters.inspectPoster(saved.path, database.storage), null);
+  }
+  const legacyPath = `/media/posters/${'0'.repeat(64)}.png`;
+  database.objects.set(legacyPath, { ...stored, path: legacyPath });
+  assert.equal((await posters.inspectPoster(legacyPath, database.storage))?.sha256, sha);
+  assert.equal(await posters.inspectPoster('/media/posters/../../secret', database.storage), null);
   assert.deepEqual(await readdir(directory), []);
 });

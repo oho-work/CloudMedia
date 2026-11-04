@@ -106,7 +106,7 @@ export class PosterArchiver {
     const before = JSON.stringify({ poster: movie.poster, archive: movie.posterArchive });
     const changed = remote(originalUrl) && originalUrl !== movie.posterArchive?.originalUrl;
     const archive = this.prepare(movie, originalUrl, referer);
-    const previous = await inspectPoster(movie.poster || archive.path);
+    const previous = await inspectPoster(movie.poster || archive.path, this.store.posterStorage);
     if (movie.posterArchive !== archive) return;
     movie.poster = previous?.path || '';
     if (previous && !changed && !force && (archive.status === 'saved' || !archive.originalUrl)) {
@@ -127,13 +127,13 @@ export class PosterArchiver {
         if (recovered) { archive.originalUrl = recovered.url; archive.referer = recovered.referer; }
       }
       if (!archive.originalUrl) {
-        archive.status = 'missing'; archive.error = '原图片文件缺失，且没有可恢复的原图地址；请恢复图片备份或重新采集。';
+        archive.status = 'missing'; archive.error = '已归档图片缺失，且没有可恢复的原图地址；请重新采集。';
         archive.nextRetryAt = new Date(Date.now() + 86400000).toISOString();
       } else {
         const source = this.store.state.sources.find(item => movie.sourceRefs.some(reference => reference.sourceId === item.id && reference.pageUrl === archive.referer))
           || movie.sourceRefs.map(reference => this.store.state.sources.find(item => item.id === reference.sourceId)).find(Boolean);
         const interval = source ? Math.max(0, source.requestIntervalMs) : 1000;
-        const file = await archivePoster(archive.originalUrl, archive.referer, this.store.state.settings, signal, target => this.throttle(target.href, signal, interval));
+        const file = await archivePoster(archive.originalUrl, archive.referer, this.store.state.settings, signal, target => this.throttle(target.href, signal, interval), this.store.posterStorage);
         if (movie.posterArchive !== archive) return;
         movie.poster = file.path;
         Object.assign(archive, file, { status: 'saved', error: null, nextRetryAt: null });
