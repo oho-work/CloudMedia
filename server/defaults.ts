@@ -28,5 +28,4 @@ export function sourceDefaults(input: Partial<Source> = {}): Source {
 }
 export const initialState = (): State => ({ sources: [
   sourceDefaults({ name: '555 影视', baseUrl: 'https://www.555k03.com', listPath: '/label/new.html', enabled: false }),
-  sourceDefaults({ name: 'zc0577', baseUrl: 'https://m.zc0577.com', enabled: false }),
 ], movies: [], resources: [], runs: [], settings: { ...defaultSettings } });
