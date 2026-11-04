@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { CollectedMovie, CollectionRequest, Resource, Run, Source } from '../shared/types.js';
+import type { CollectedMovie, CollectionRequest, DateRange, Resource, Run, Source } from '../shared/types.js';
 import { collectSource, resolvePlaybackPage } from './collector.js';
 import { rememberResource, upsertMovie } from './catalog.js';
 import { probeResource } from './hls.js';
@@ -11,6 +11,24 @@ import { resolveDateRange } from './dates.js';
 
 export class WorkerRequestError extends Error {
   constructor(message: string, readonly status: 400 | 409) { super(message); }
+}
+
+function collectionRange(source: Source, request: CollectionRequest, timezone: string): DateRange | undefined {
+  const hasDates = request.startDate !== undefined || request.endDate !== undefined;
+  const mode = request.mode || (hasDates ? 'range' : source.collectionMode === 'updates' ? 'today' : source.collectionMode || 'all');
+  if (mode === 'all') return undefined;
+  if (source.adapter !== 'html') throw new WorkerRequestError('按日期采集需要 HTML 页面适配器', 400);
+  try {
+    if (mode === 'today') return resolveDateRange({}, timezone);
+    const dates = hasDates ? request : { startDate: source.startDate, endDate: source.endDate };
+    // Old date-only API requests keep their single-day shorthand; configured/explicit ranges need both boundaries.
+    if ((request.mode === 'range' || !hasDates) && (!dates.startDate || !dates.endDate)) throw new Error('区间采集需要开始日期和结束日期');
+    return resolveDateRange(dates, timezone);
+  } catch (error) { throw new WorkerRequestError(error instanceof Error ? error.message : '日期范围无效', 400); }
+}
+
+function sameRange(left?: DateRange, right?: DateRange) {
+  return left?.startDate === right?.startDate && left?.endDate === right?.endDate && left?.timezone === right?.timezone;
 }
 
 export class Worker {
@@ -25,17 +43,17 @@ export class Worker {
   readonly posters: PosterArchiver;
   constructor(private store: Store) { this.posters = new PosterArchiver(store); }
   enqueue(source: Source, request: CollectionRequest = {}): Run {
-    if (source.collectionMode !== 'updates' && (request.startDate !== undefined || request.endDate !== undefined)) throw new WorkerRequestError('此采集源未启用按更新日期采集', 400);
-    const dateRange = source.collectionMode === 'updates' ? resolveDateRange(request, this.store.state.settings.timezone) : undefined;
+    const dateRange = collectionRange(source, request, this.store.state.settings.timezone);
     const existing = this.store.state.runs.find(run => run.sourceId === source.id && ['queued', 'running'].includes(run.status));
     if (existing) {
-      if (JSON.stringify(existing.dateRange) !== JSON.stringify(dateRange)) throw new WorkerRequestError('该源已有其他日期范围的采集任务，请等待完成或取消后重试', 409);
+      if (!sameRange(existing.dateRange, dateRange)) throw new WorkerRequestError('该源已有其他采集范围的任务，请等待完成或取消后重试', 409);
       return existing;
     }
     const run: Run = { id: randomUUID(), sourceId: source.id, sourceName: source.name, status: 'queued', startedAt: new Date().toISOString(), finishedAt: null, scanned: 0, added: 0, updated: 0, resourceCount: 0, errors: [], message: '等待采集', ...(dateRange ? { dateRange } : {}) };
     this.store.state.runs.unshift(run);
     const snapshot = structuredClone(source);
-    if (dateRange) snapshot.maxPages = snapshot.maxItems = snapshot.maxResourcePages = 0;
+    snapshot.collectionMode = dateRange ? 'updates' : 'all';
+    snapshot.maxPages = snapshot.maxItems = snapshot.maxResourcePages = 0;
     this.queue.push({ source: snapshot, run });
     this.runControllers.set(run.id, new AbortController());
     this.store.state.runs = this.store.state.runs.slice(0, 1000);
@@ -158,7 +176,9 @@ export class Worker {
       if (refresh) {
         const source = this.store.state.sources.find(item => item.id === resource.sourceId);
         if (!source || !resource.pageUrl) throw new Error('该资源没有可用的原始播放页，请重新采集来源');
-        const resolved = await resolvePlaybackPage(source, resource.pageUrl, { settings: this.store.state.settings, signal, log: () => {} });
+        const movie = this.store.state.movies.find(item => item.id === resource.movieId);
+        const detailPage = movie?.sourceRefs.find(reference => reference.sourceId === source.id && reference.pageUrl)?.pageUrl;
+        const resolved = await resolvePlaybackPage(source, resource.pageUrl, { settings: this.store.state.settings, signal, log: () => {} }, detailPage || source.baseUrl);
         const selected = resolved.find(item => item.url === resource.url) || (resolved.length === 1 ? resolved[0] : undefined);
         if (!selected) throw new Error(resolved.length ? '原始页面有多个播放地址，请从采集源重新采集以确认剧集' : '原始页面未发现公开的 m3u8 地址');
         rememberResource(resource);
@@ -187,7 +207,8 @@ export class Worker {
       for (const source of this.store.state.sources) {
         if (!source.enabled) continue;
         if (this.store.state.runs.some(run => run.sourceId === source.id && ['queued', 'running'].includes(run.status))) continue;
-        const ranToday = this.store.state.runs.some(run => run.sourceId === source.id && localMinute(new Date(run.startedAt), settings.timezone).day === now.day && (source.collectionMode !== 'updates' || !run.dateRange || (run.dateRange.startDate <= now.day && run.dateRange.endDate >= now.day)));
+        const scope = collectionRange(source, {}, settings.timezone);
+        const ranToday = this.store.state.runs.some(run => run.sourceId === source.id && localMinute(new Date(run.startedAt), settings.timezone).day === now.day && sameRange(run.dateRange, scope));
         if (!ranToday) this.enqueue(source);
       }
       await this.store.save();

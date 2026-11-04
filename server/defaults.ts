@@ -19,10 +19,12 @@ export function sourceDefaults(input: Partial<Source> = {}): Source {
     posterSelector: '.module-item-pic img, .vodlist_thumb img', descriptionSelector: '.module-info-introduction, .vod_content',
     resourceSelector: 'a[href*="/vodplay/"], a[href$=".m3u8"]', nextPageSelector: 'a[title="下一页"]',
     jsonItemsPath: 'list', jsonTitleField: 'vod_name', jsonUrlField: 'vod_play_url',
-    requestIntervalMs: 2500, maxPages: 2, maxItems: 30, maxResourcePages: 30, respectRobots: true,
-    referer: '', createdAt: new Date().toISOString(), lastRunAt: null, lastError: null,
-    collectionMode: bundledUpdates ? 'updates' : 'all', updatesSortedDescending: bundledUpdates,
+    requestIntervalMs: 2500,
+    createdAt: new Date().toISOString(), lastRunAt: null, lastError: null,
+    updatesSortedDescending: bundledUpdates,
     ...input,
+    collectionMode: input.collectionMode === 'updates' ? 'today' : input.collectionMode || (bundledUpdates ? 'today' : 'all'),
+    maxPages: 0, maxItems: 0, maxResourcePages: 0, respectRobots: false, referer: '',
     ...(bundledUpdates && input.detailLinkSelector === 'a[href*="/voddetail/"]' ? { detailLinkSelector: '.module-poster-item[href*="/voddetail/"]' } : {}),
   };
 }

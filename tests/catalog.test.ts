@@ -6,6 +6,18 @@ import { nextScheduledAt, localMinute } from '../server/scheduler.js';
 import { sourceSchema, settingsSchema } from '../server/validation.js';
 import { parseJsonMovie } from '../server/collector.js';
 
+test('resource Referer follows the original page and ignores legacy source overrides', () => {
+  const state = initialState();
+  const source = { ...sourceDefaults({ baseUrl: 'https://example.com' }), referer: 'https://custom.example/' };
+  const input = { externalId: 'referer', pageUrl: 'https://example.com/detail/1', title: '原页面', resources: [{ name: '线路', episode: '正片', url: 'https://cdn.example.com/video.m3u8' }] };
+  const resource = upsertMovie(state, source, input).resources[0];
+  assert.equal(resource.referer, input.pageUrl);
+  resource.referer = source.referer;
+  assert.equal(upsertMovie(state, source, input).resources[0].referer, input.pageUrl);
+  const playPage = 'https://example.com/play/1';
+  assert.equal(upsertMovie(state, source, { ...input, resources: [{ ...input.resources[0], referer: playPage }] }).resources[0].referer, playPage);
+});
+
 test('empty episode labels from JSON collection keep a stable resource identity', () => {
   // Lookup and insertion must use the same default episode, including a channel with no episode label.
   const state = initialState(); const source = sourceDefaults({ name: 'Fixture', baseUrl: 'https://example.com' });

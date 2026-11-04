@@ -5,42 +5,6 @@ import { readTextLimited, safeFetch, safeUrlLabel } from './upstream.js';
 import { resolveDateRange, sourceDate } from './dates.js';
 
 type Json = Record<string, any>;
-interface RobotPolicy { rules: { allow: boolean; pattern: string }[]; delayMs: number }
-
-export function parseRobots(text: string, userAgent: string): RobotPolicy {
-  const groups: { agents: string[]; rules: RobotPolicy['rules']; delayMs: number }[] = [];
-  let group: typeof groups[number] | null = null;
-  let directives = false;
-  for (const raw of text.split(/\r?\n/)) {
-    const line = raw.replace(/#.*/, '').trim();
-    const match = line.match(/^([^:]+):\s*(.*)$/);
-    if (!match) continue;
-    const key = match[1].trim().toLowerCase(); const value = match[2].trim();
-    if (key === 'user-agent') {
-      if (!group || directives) { group = { agents: [], rules: [], delayMs: 0 }; groups.push(group); directives = false; }
-      group.agents.push(value.toLowerCase());
-    } else if (group) {
-      directives = true;
-      if ((key === 'allow' || key === 'disallow') && value) group.rules.push({ allow: key === 'allow', pattern: value });
-      if (key === 'crawl-delay' && Number.isFinite(Number(value))) group.delayMs = Math.max(0, Number(value) * 1000);
-    }
-  }
-  const agent = userAgent.toLowerCase();
-  const score = (candidate: typeof groups[number]) => Math.max(-1, ...candidate.agents.map(value => value === '*' ? 0 : agent.includes(value) ? value.length : -1));
-  const specificity = Math.max(-1, ...groups.map(score));
-  return groups.filter(candidate => score(candidate) === specificity && specificity >= 0)
-    .reduce<RobotPolicy>((result, candidate) => ({ rules: [...result.rules, ...candidate.rules], delayMs: Math.max(result.delayMs, candidate.delayMs) }), { rules: [], delayMs: 0 });
-}
-
-export function robotsAllows(policy: RobotPolicy, url: URL): boolean {
-  const path = `${url.pathname}${url.search}`;
-  const matches = policy.rules.filter(rule => {
-    const escaped = rule.pattern.replace(/[.+?^{}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
-    return new RegExp(`^${escaped}`).test(path);
-  }).sort((a, b) => b.pattern.replace(/\*/g, '').length - a.pattern.replace(/\*/g, '').length || Number(b.allow) - Number(a.allow));
-  return matches[0]?.allow ?? true;
-}
-
 function field(value: any, path: string): any {
   if (!path) return value;
   return path.split('.').reduce((item, key) => item?.[key], value);
@@ -53,7 +17,6 @@ function absolute(value: string, base: string): string {
   try { const url = base ? new URL(value, base) : new URL(value); return ['https:', 'http:'].includes(url.protocol) ? url.href : ''; } catch { return ''; }
 }
 function isHls(value: string): boolean { try { return /\.m3u8(?:$|[?#])/i.test(new URL(value).href); } catch { return false; } }
-function withinLimit(count: number, maximum: number): boolean { return maximum === 0 || count < maximum; }
 function pageKey(value: string): string { const url = new URL(value); url.hash = ''; return url.href; }
 
 export function parsePlayUrls(value: unknown, names: unknown = '', base = ''): CollectedResource[] {
@@ -113,7 +76,7 @@ export function parseJsonMovie(item: Json, source: Source, pageUrl: string): Col
   });
   const id = text(item.vod_id ?? item.id ?? item.externalId) || `${title}:${text(item.vod_year ?? item.year)}`;
   const detailPage = absolute(text(item.pageUrl ?? item.vod_detail_url), source.baseUrl) || pageUrl;
-  resources = resources.map(resource => ({ ...resource, pageUrl: detailPage, resolvedAt: new Date().toISOString() }));
+  resources = resources.map(resource => ({ ...resource, referer: detailPage, pageUrl: detailPage, resolvedAt: new Date().toISOString() }));
   return { externalId: id, pageUrl: detailPage,
     title, originalTitle: text(item.vod_en ?? item.originalTitle), year: text(item.vod_year ?? item.year),
     region: text(item.vod_area ?? item.region), type: text(item.type_name ?? item.type),
@@ -126,35 +89,19 @@ export function parseJsonMovie(item: Json, source: Source, pageUrl: string): Col
 
 class SourceClient {
   private lastRequest = 0;
-  private robots = new Map<string, RobotPolicy>();
   constructor(private source: Source, private context: CollectionContext) {}
-  private headers() { return { 'user-agent': this.context.settings.userAgent, accept: 'text/html,application/json;q=0.9,*/*;q=0.5', ...(this.source.referer ? { referer: this.source.referer } : {}) }; }
-  private async policy(url: URL): Promise<RobotPolicy> {
-    if (!this.source.respectRobots) return { rules: [], delayMs: 0 };
-    const existing = this.robots.get(url.origin); if (existing) return existing;
-    const response = await safeFetch(new URL('/robots.txt', url.origin), { headers: this.headers(), signal: this.context.signal });
-    let result: RobotPolicy;
-    if ([404, 410].includes(response.status)) { await response.body?.cancel(); result = { rules: [], delayMs: 0 }; }
-    else if (!response.ok) {
-      await response.body?.cancel();
-      const message = `robots.txt 返回 HTTP ${response.status}，停止采集`;
-      if ([408, 429].includes(response.status) || response.status >= 500) throw new Error(message);
-      throw new StopError(message);
-    }
-    else result = parseRobots(await readTextLimited(response, 512 * 1024), this.context.settings.userAgent);
-    this.lastRequest = Date.now(); this.robots.set(url.origin, result); return result;
+  private headers(referer: string) {
+    return { 'user-agent': this.context.settings.userAgent, accept: 'text/html,application/json;q=0.9,*/*;q=0.5', referer: new URL(referer).href };
   }
-  async get(value: string): Promise<{ body: string; url: string }> {
+  async get(value: string, referer = this.source.baseUrl): Promise<{ body: string; url: string }> {
     const url = new URL(value);
     const interval = Math.max(500, this.source.requestIntervalMs);
     for (let attempt = 0; attempt <= this.context.settings.maxRetries; attempt++) {
       try {
-        const response = await safeFetch(url, { headers: this.headers(), signal: this.context.signal }, {
+        const response = await safeFetch(url, { headers: this.headers(referer), signal: this.context.signal }, {
           timeoutMs: 15000 + Math.max(this.source.requestIntervalMs, 0),
-          beforeRequest: async target => {
-            const policy = await this.policy(target);
-            if (!robotsAllows(policy, target)) throw new StopError(`robots.txt 禁止访问 ${safeUrlLabel(target.href)}`);
-            const wait = Math.max(0, Math.max(interval, policy.delayMs) - (Date.now() - this.lastRequest));
+          beforeRequest: async () => {
+            const wait = Math.max(0, interval - (Date.now() - this.lastRequest));
             if (wait) await delay(wait, undefined, { signal: this.context.signal });
             this.lastRequest = Date.now();
           },
@@ -184,10 +131,10 @@ class StopError extends Error {}
 class PageError extends Error {}
 
 /** Refresh one stored public player page without executing its scripts. */
-export async function resolvePlaybackPage(source: Source, pageUrl: string, context: CollectionContext): Promise<CollectedResource[]> {
+export async function resolvePlaybackPage(source: Source, pageUrl: string, context: CollectionContext, referer = source.baseUrl): Promise<CollectedResource[]> {
   const target = absolute(pageUrl, source.baseUrl);
   if (!target || new URL(target).origin !== new URL(source.baseUrl).origin) throw new Error('播放页必须位于当前采集源域名下');
-  const content = await new SourceClient(source, context).get(target);
+  const content = await new SourceClient(source, context).get(target, referer);
   const urls = content.body.trimStart().startsWith('#EXTM3U') ? [content.url] : extractPlayerUrls(content.body, content.url);
   if (!urls.length) throw new Error('播放页未发现公开 m3u8 地址；可能已失效或需要更新采集规则');
   const resolvedAt = new Date().toISOString();
@@ -323,7 +270,7 @@ function htmlPlan(movie: CollectedMovie, detail: { body: string; url: string }, 
   return { movie, resources, playPages };
 }
 
-async function populateHtmlResources(plan: HtmlPlan, source: Source, client: SourceClient, context: CollectionContext): Promise<CollectedMovie> {
+async function populateHtmlResources(plan: HtmlPlan, client: SourceClient, context: CollectionContext): Promise<CollectedMovie> {
   const { movie, resources, playPages } = plan;
   const freshByPage = new Map<string, CollectedResource[]>();
   for (const resource of context.existingResources?.(movie.externalId) ?? []) {
@@ -340,19 +287,16 @@ async function populateHtmlResources(plan: HtmlPlan, source: Source, client: Sou
   }
   // New episodes win over old pages whose cached URLs need periodic refresh.
   const orderedPending = orderPlaybackPages(pending, knownPages);
-  const maxResourcePages = source.maxResourcePages;
-  if (maxResourcePages > 0 && pending.length > maxResourcePages) context.log(`「${movie.title}」本次读取前 ${maxResourcePages} 个待采集播放页，剩余 ${pending.length - maxResourcePages} 个留待后续任务；下次优先最新未采集剧集`);
-  const selectedPages = maxResourcePages === 0 ? orderedPending : orderedPending.slice(0, maxResourcePages);
   let attemptedPages = 0;
   const checkpoint = async () => {
     if (context.onCheckpoint) await context.onCheckpoint(structuredClone({ ...movie, resources: [...resources.values()] }));
   };
   await checkpoint();
-  try { for (const play of selectedPages) {
+  try { for (const play of orderedPending) {
     context.signal?.throwIfAborted();
-    context.log(`正在采集「${movie.title}」${play.name} / ${play.episode}（${attemptedPages + 1}/${selectedPages.length} 个播放页）`);
+    context.log(`正在采集「${movie.title}」${play.name} / ${play.episode}（${attemptedPages + 1}/${orderedPending.length} 个播放页）`);
     try {
-      const content = await client.get(play.url);
+      const content = await client.get(play.url, movie.pageUrl);
       const urls = extractPlayerUrls(content.body, content.url);
       if (!urls.length) {
         const message = `「${movie.title}」${play.name} / ${play.episode} 未发现公开 m3u8，保留影片资料及已有资源`;
@@ -376,16 +320,23 @@ async function populateHtmlResources(plan: HtmlPlan, source: Source, client: Sou
 }
 
 export async function* collectSource(source: Source, context: CollectionContext): AsyncGenerator<CollectedMovie> {
-  const dateRange = context.dateRange ?? (source.collectionMode === 'updates' ? resolveDateRange({}, context.settings.timezone) : undefined);
+  let dateRange = context.dateRange;
+  if (!dateRange) {
+    if (source.collectionMode === 'updates' || source.collectionMode === 'today') dateRange = resolveDateRange({}, context.settings.timezone);
+    else if (source.collectionMode === 'range') {
+      if (!source.startDate || !source.endDate) throw new Error('区间采集需要开始日期和结束日期');
+      dateRange = resolveDateRange({ startDate: source.startDate, endDate: source.endDate }, context.settings.timezone);
+    }
+  }
   let incompletePages = 0;
   if (dateRange) {
     if (source.adapter !== 'html') throw new Error('日期范围采集目前仅支持有明确更新时间的 HTML 列表');
-    source = { ...source, maxPages: 0, maxItems: 0, maxResourcePages: 0 };
     const reportError = context.onCollectionError;
     context = { ...context, dateRange, onCollectionError: message => { incompletePages++; reportError?.(message); } };
     context.log(`采集更新日期 ${dateRange.startDate} 至 ${dateRange.endDate}（${dateRange.timezone}）`);
   }
   const client = new SourceClient(source, context);
+  let listingReferer = source.baseUrl;
   let pageUrl = absolute(source.listPath || '/', source.baseUrl);
   if (!pageUrl) throw new Error('源站列表地址无效');
   let count = 0;
@@ -394,7 +345,7 @@ export async function* collectSource(source: Source, context: CollectionContext)
     const visitedPages = new Set<string>();
     const visitedMovies = new Set<string>();
     const seenItemPages = new Set<string>();
-    for (let page = 1; withinLimit(page - 1, source.maxPages) && withinLimit(count, source.maxItems); page++) {
+    for (let page = 1; ; page++) {
       const url = new URL(pageUrl);
       if (source.adapter === 'maccms') { url.searchParams.set('ac', 'detail'); url.searchParams.set('pg', String(page)); }
       const canonical = new URL(url);
@@ -403,7 +354,8 @@ export async function* collectSource(source: Source, context: CollectionContext)
       if (visitedPages.has(key)) { context.log('JSON 列表分页地址重复，已停止翻页'); break; }
       visitedPages.add(key);
       context.log(`读取列表第 ${page} 页`);
-      const response = await client.get(url.href);
+      const response = await client.get(url.href, listingReferer);
+      listingReferer = response.url;
       let parsed: any; try { parsed = JSON.parse(response.body); } catch { throw new Error('源站未返回 JSON；请检查适配器和列表路径'); }
       const items = field(parsed, source.jsonItemsPath || 'list');
       if (!Array.isArray(items)) throw new Error(`JSON 列表路径 ${source.jsonItemsPath || 'list'} 没有返回数组`);
@@ -416,7 +368,7 @@ export async function* collectSource(source: Source, context: CollectionContext)
       for (const movie of movies) {
         if (visitedMovies.has(movie.externalId)) continue;
         visitedMovies.add(movie.externalId); newMovies++;
-        yield movie; count++; if (!withinLimit(count, source.maxItems)) break;
+        yield movie; count++;
       }
       if (!newMovies) { context.log('JSON 列表没有新的影片，已停止翻页'); break; }
       const pageCount = Number(parsed.pagecount ?? parsed.pageCount ?? parsed.total_pages);
@@ -442,7 +394,7 @@ export async function* collectSource(source: Source, context: CollectionContext)
     const visited = new Set<string>();
     const visitedPages = new Set<string>();
     const visitedMovies = new Set<string>();
-    for (let page = 1; withinLimit(page - 1, source.maxPages) && withinLimit(count, source.maxItems) && pageUrl; page++) {
+    for (let page = 1; pageUrl; page++) {
       const key = pageKey(pageUrl);
       if (visitedPages.has(key)) {
         if (dateRange) throw new Error('更新列表分页形成循环，日期范围采集未完成');
@@ -450,7 +402,8 @@ export async function* collectSource(source: Source, context: CollectionContext)
       }
       visitedPages.add(key);
       context.log(`读取页面第 ${page} 页`);
-      const response = await client.get(pageUrl); const $ = load(response.body);
+      const response = await client.get(pageUrl, listingReferer); const $ = load(response.body);
+      listingReferer = response.url;
       const finalKey = pageKey(response.url);
       if (finalKey !== key && visitedPages.has(finalKey)) {
         if (dateRange) throw new Error('更新列表重定向形成循环，日期范围采集未完成');
@@ -469,10 +422,9 @@ export async function* collectSource(source: Source, context: CollectionContext)
       }
       if (!details.size && !dateRange) { context.log('列表没有新的影片链接，已停止翻页'); break; }
       for (const detailUrl of details) {
-        if (!withinLimit(count, source.maxItems)) break;
         visited.add(detailUrl);
         let detail: { body: string; url: string };
-        try { detail = await client.get(detailUrl); }
+        try { detail = await client.get(detailUrl, response.url); }
         catch (error) {
           if (error instanceof StopError || context.signal?.aborted) throw error;
           if (dateRange) {
@@ -504,7 +456,7 @@ export async function* collectSource(source: Source, context: CollectionContext)
           updatePlans.push(plan); count++;
           context.log(`已发现 ${count} 部日期范围内影片，正在读取影片资料`);
         } else {
-          yield await populateHtmlResources(plan, source, client, context); count++;
+          yield await populateHtmlResources(plan, client, context); count++;
         }
       }
       if (reachedStart) { context.log('已到达开始日期之前的记录，停止翻页'); break; }
@@ -515,7 +467,7 @@ export async function* collectSource(source: Source, context: CollectionContext)
     for (let index = 0; index < updatePlans.length; index++) {
       context.signal?.throwIfAborted();
       context.log(`已归档 ${updatePlans.length} 部影片资料，补齐第 ${index + 1}/${updatePlans.length} 部播放资源`);
-      yield await populateHtmlResources(updatePlans[index], source, client, context);
+      yield await populateHtmlResources(updatePlans[index], client, context);
     }
   }
   context.log(`本次读取 ${count} 部影片`);

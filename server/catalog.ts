@@ -51,14 +51,14 @@ export function upsertMovie(state: State, source: Source, input: CollectedMovie)
       existing.name = name; existing.episode = episode;
       const resolvedAt = entry.resolvedAt || now;
       if (existing.url !== url.href || existing.resolvedAt !== resolvedAt) { existing.url = url.href; existing.probe = emptyProbe(); }
-      existing.referer = entry.referer || source.referer || input.pageUrl;
+      existing.referer = entry.referer || input.pageUrl;
       if (entry.pageUrl) existing.pageUrl = entry.pageUrl;
       existing.resolvedAt = resolvedAt;
       existing.updatedAt = now;
       rememberResource(existing);
       resources.push(existing);
     } else {
-      const resource: Resource = { id: randomUUID(), movieId: movie.id, sourceId: source.id, name, episode, url: url.href, referer: entry.referer || source.referer || input.pageUrl, pageUrl: entry.pageUrl, resolvedAt: entry.resolvedAt || now, probe: emptyProbe(), createdAt: now, updatedAt: now };
+      const resource: Resource = { id: randomUUID(), movieId: movie.id, sourceId: source.id, name, episode, url: url.href, referer: entry.referer || input.pageUrl, pageUrl: entry.pageUrl, resolvedAt: entry.resolvedAt || now, probe: emptyProbe(), createdAt: now, updatedAt: now };
       state.resources.push(resource); resources.push(resource);
       rememberResource(resource);
     }

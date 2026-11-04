@@ -1,11 +1,15 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
+import { useCallback, useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import type Hls from 'hls.js';
 import { Activity, ArrowDownToLine, ArrowRight, Check, ChevronDown, ChevronLeft, ChevronRight, CircleAlert, Clock3, Clapperboard, Database, ExternalLink, Film, Globe2, Layers3, ListVideo, LoaderCircle, LockKeyhole, Pencil, Play, Plus, Radio, RefreshCw, Search, Settings2, ShieldCheck, SlidersHorizontal, Trash2, Wifi, X } from 'lucide-react';
-import type { Dashboard, Movie, Resource, Run, Settings, Source } from '../shared/types';
+import type { CollectionRequest, Dashboard, Movie, Resource, Run, Settings, Source } from '../shared/types';
 import { localPosterPath } from '../shared/poster-path';
 
 type Page = 'library' | 'sources' | 'runs' | 'settings';
 type MovieList = { items: (Movie & { resourceCount: number })[]; total: number; page: number; limit: number; types: string[]; years: string[] };
+type CollectionMode = 'today' | 'all' | 'range';
+const collectionMode = (source: Partial<Source>): CollectionMode => source.adapter !== 'html' ? 'all' : source.collectionMode === 'updates' ? 'today' : source.collectionMode || 'all';
+const validCalendarDate = (value: string) => /^\d{4}-\d{2}-\d{2}$/.test(value) && Number.isFinite(new Date(`${value}T00:00:00Z`).getTime()) && new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) === value;
+const validDateRange = (startDate: string, endDate: string) => validCalendarDate(startDate) && validCalendarDate(endDate) && startDate <= endDate;
 const tokenKey = 'cloudmedia-token';
 const date = (value: string | null) => value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '尚未运行';
 const statusNames: Record<Run['status'], string> = { queued: '等待中', running: '采集中', success: '已完成', error: '失败', interrupted: '已中断' };
@@ -90,11 +94,7 @@ export default function App() {
     return () => { active = false; clearInterval(timer); };
   }, [revision]);
   const navigate = (next: Page) => { setPage(next); setError(''); };
-  const runSource = async (source: Source) => {
-    if (source.collectionMode === 'updates') { setSourceRun(source); return; }
-    try { await api<Run>(`/sources/${source.id}/run`, { method: 'POST' }); notify(`已提交「${source.name}」采集任务`); reload(); }
-    catch (e) { setError((e as Error).message); }
-  };
+  const runSource = async (source: Source) => { setSourceRun(source); };
   const saveToken = async (event: FormEvent) => {
     event.preventDefault(); setAuthBusy(true); localStorage.setItem(tokenKey, token.trim());
     try { await api('/dashboard'); setAuthNeeded(false); setToken(''); setError(''); reload(); }
@@ -156,26 +156,46 @@ function Library({ dashboard, sources, revision, onMovie, onSource, onNavigateSo
 
 function Sources({ sources, dashboard, onEdit, onRun, onChanged, notify, onError }: { sources: Source[]; dashboard: Dashboard | null; onEdit: (source: Source | 'new') => void; onRun: (source: Source) => Promise<void>; onChanged: () => void; notify: (message: string) => void; onError: (message: string) => void }) {
   const [busy, setBusy] = useState('');
-  const mutate = async (source: Source, action: 'toggle' | 'delete' | 'run') => {
+  const mutate = async (source: Source, action: 'toggle' | 'delete') => {
     if (action === 'delete' && !window.confirm(`删除采集源「${source.name}」？已采集的影片和播放资源会保留。`)) return;
     setBusy(source.id);
     try {
-      if (action === 'run') await onRun(source);
-      else if (action === 'toggle') { await api(`/sources/${source.id}`, { method: 'PUT', body: JSON.stringify({ ...source, enabled: !source.enabled }) }); notify(source.enabled ? '已暂停定时采集此源' : '已启用此采集源'); }
+      if (action === 'toggle') { await api(`/sources/${source.id}`, { method: 'PUT', body: JSON.stringify({ ...source, enabled: !source.enabled }) }); notify(source.enabled ? '已暂停定时采集此源' : '已启用此采集源'); }
       else { await api(`/sources/${source.id}`, { method: 'DELETE' }); notify('采集源已删除，本地资料已保留'); }
       onChanged();
     } catch (e) { onError((e as Error).message); } finally { setBusy(''); }
   };
   return <><div className="page-heading"><div><div className="eyebrow">COLLECTION SOURCES</div><h1>采集源</h1><p>管理内容入口，让最新的电影与剧集自动归档。</p></div><button className="button primary" onClick={() => onEdit('new')}><Plus size={17} />添加采集源</button></div><div className="info-strip"><ShieldCheck size={18} /><span>支持公开 HTML 页面、MacCMS 与 JSON 接口。域名变化时编辑入口地址，本地影片资料会保留。</span></div>
     <div className="source-summary"><span>{sources.length} 个采集源</span><span><i className="status-dot online" />{dashboard?.enabledSourceCount ?? sources.filter(source => source.enabled).length} 个已启用</span></div>
-    {!sources.length ? <div className="panel empty-small"><Globe2 size={36} /><h3>连接你的第一个内容源</h3><p>设置站点入口和解析方式，然后手动采集验证结果。</p><button className="button secondary" onClick={() => onEdit('new')}><Plus size={16} />添加采集源</button></div> : <div className="source-grid">{sources.map(source => <article className="source-card" key={source.id}><div className="source-card-head"><span className="source-icon"><Globe2 size={22} /></span><div><h3>{source.name}</h3><span className={`badge ${source.enabled ? 'success' : 'muted'}`}>{source.enabled ? '已启用' : '已暂停'}</span></div><div className="source-toggle"><Toggle checked={source.enabled} label={`${source.name}启用状态`} onChange={() => void mutate(source, 'toggle')} /></div></div><a className="source-url" href={source.baseUrl} target="_blank" rel="noreferrer">{source.baseUrl}<ExternalLink size={12} /></a><div className="source-details"><div><span>解析方式</span><strong>{source.adapter === 'maccms' ? 'MacCMS API' : source.adapter === 'json' ? 'JSON API' : 'HTML 页面'}</strong></div><div><span>请求间隔</span><strong>{(source.requestIntervalMs / 1000).toFixed(1)} 秒</strong></div><div><span>{source.collectionMode === 'updates' ? '采集范围' : '每次上限'}</span><strong>{source.collectionMode === 'updates' ? '默认今天 / 支持日期区间' : <>{source.maxItems === 0 ? '不限影片' : `${source.maxItems} 部`} / {source.maxPages === 0 ? '不限页数' : `${source.maxPages} 页`}</>}</strong></div><div><span>每部影片播放页</span><strong>{source.collectionMode === 'updates' || source.maxResourcePages === 0 ? '全部播放页' : `每次最多 ${source.maxResourcePages ?? 30} 页`}</strong></div><div><span>最近采集</span><strong>{date(source.lastRunAt)}</strong></div></div>{source.lastError && <div className="source-error"><CircleAlert size={13} /><span>{source.lastError}</span></div>}<div className="source-actions"><button className="button secondary" disabled={busy === source.id} onClick={() => void mutate(source, 'run')}>{busy === source.id ? <Spinner /> : <Play size={14} />}立即采集</button><button className="text-button" onClick={() => onEdit(source)}><Pencil size={14} />编辑</button><IconButton label={`删除${source.name}`} disabled={busy === source.id} onClick={() => void mutate(source, 'delete')}><Trash2 size={15} /></IconButton></div></article>)}</div>}
+    {!sources.length ? <div className="panel empty-small"><Globe2 size={36} /><h3>连接你的第一个内容源</h3><p>设置站点入口和解析方式，然后手动采集验证结果。</p><button className="button secondary" onClick={() => onEdit('new')}><Plus size={16} />添加采集源</button></div> : <div className="source-grid">{sources.map(source => <article className="source-card" key={source.id}><div className="source-card-head"><span className="source-icon"><Globe2 size={22} /></span><div><h3>{source.name}</h3><span className={`badge ${source.enabled ? 'success' : 'muted'}`}>{source.enabled ? '已启用' : '已暂停'}</span></div><div className="source-toggle"><Toggle checked={source.enabled} label={`${source.name}启用状态`} onChange={() => void mutate(source, 'toggle')} /></div></div><a className="source-url" href={source.baseUrl} target="_blank" rel="noreferrer">{source.baseUrl}<ExternalLink size={12} /></a><div className="source-details"><div><span>解析方式</span><strong>{source.adapter === 'maccms' ? 'MacCMS API' : source.adapter === 'json' ? 'JSON API' : 'HTML 页面'}</strong></div><div><span>请求间隔</span><strong>{(source.requestIntervalMs / 1000).toFixed(1)} 秒</strong></div><div><span>默认采集范围</span><strong>{collectionMode(source) === 'today' ? '今天' : collectionMode(source) === 'range' ? `${source.startDate || '待设置'} 至 ${source.endDate || '待设置'}` : '全部'}</strong></div><div><span>最近采集</span><strong>{date(source.lastRunAt)}</strong></div></div>{source.lastError && <div className="source-error"><CircleAlert size={13} /><span>{source.lastError}</span></div>}<div className="source-actions"><button className="button secondary" disabled={busy === source.id} onClick={() => void onRun(source)}>{busy === source.id ? <Spinner /> : <Play size={14} />}立即采集</button><button className="text-button" onClick={() => onEdit(source)}><Pencil size={14} />编辑</button><IconButton label={`删除${source.name}`} disabled={busy === source.id} onClick={() => void mutate(source, 'delete')}><Trash2 size={15} /></IconButton></div></article>)}</div>}
   </>;
+}
+
+function CollectionScope({ mode, onModeChange, html, startDate, endDate, onStartDate, onEndDate, disabled = false }: {
+  mode: CollectionMode; onModeChange: (mode: CollectionMode) => void; html: boolean;
+  startDate: string; endDate: string; onStartDate: (value: string) => void; onEndDate: (value: string) => void; disabled?: boolean;
+}) {
+  const name = useId();
+  return <fieldset className="collection-scope" disabled={disabled}>
+    <legend>采集范围</legend>
+    <div className="collection-scope-options">{([['today', '今天'], ['all', '全部'], ['range', '区间']] as const).map(([value, label]) =>
+      <label key={value} className={`collection-scope-option ${mode === value ? 'selected' : ''} ${!html && value !== 'all' ? 'unavailable' : ''}`}>
+        <input type="radio" name={name} value={value} checked={mode === value} disabled={!html && value !== 'all'} onChange={() => onModeChange(value)} /><span>{label}</span>
+      </label>)}
+    </div>
+    <p className="collection-scope-hint">{!html ? '此解析方式支持全部采集；按日期采集请使用 HTML 页面。' : mode === 'all' ? '采集列表中的全部影片及播放资源。' : mode === 'today' ? '按源站更新时间采集今天的内容。' : '按源站更新时间筛选，开始和结束日期均包含在内。'}</p>
+    {mode === 'range' && html && <div className="form-grid collection-date-fields">
+      <Field label="开始日期"><input type="date" value={startDate} min="0001-01-01" max={endDate || '9999-12-31'} required onChange={e => onStartDate(e.target.value)} /></Field>
+      <Field label="结束日期"><input type="date" value={endDate} min={startDate || '0001-01-01'} max="9999-12-31" required onChange={e => onEndDate(e.target.value)} /></Field>
+    </div>}
+  </fieldset>;
 }
 
 function CollectionModal({ source, onClose, onStarted }: { source: Source; onClose: () => void; onStarted: () => void }) {
   const [timezone, setTimezone] = useState<string | null>(null);
-  const [startDate, setStartDate] = useState('');
-  const [endDate, setEndDate] = useState('');
+  const [mode, setMode] = useState<CollectionMode>(() => collectionMode(source));
+  const [startDate, setStartDate] = useState(source.startDate || '');
+  const [endDate, setEndDate] = useState(source.endDate || '');
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -183,11 +203,10 @@ function CollectionModal({ source, onClose, onStarted }: { source: Source; onClo
     const parts = new Intl.DateTimeFormat('en-CA', { timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date());
     return ['year', 'month', 'day'].map(name => parts.find(part => part.type === name)!.value).join('-');
   };
-  const resetToday = (zone: string) => { const today = todayIn(zone); setStartDate(today); setEndDate(today); };
   useEffect(() => {
     let active = true;
     api<Settings>('/settings').then(settings => {
-      if (active) { setTimezone(settings.timezone); resetToday(settings.timezone); }
+      if (active) { const today = todayIn(settings.timezone); setTimezone(settings.timezone); setStartDate(value => value || today); setEndDate(value => value || today); }
     }).catch(e => { if (active) setError((e as Error).message); }).finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
   }, []);
@@ -195,22 +214,23 @@ function CollectionModal({ source, onClose, onStarted }: { source: Source; onClo
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (!timezone || busy) return;
-    if (!startDate || !endDate || startDate > endDate) { setError('请选择有效的日期区间，开始日期不能晚于结束日期。'); return; }
+    if (mode === 'range' && !validDateRange(startDate, endDate)) { setError('请选择有效的日期区间，开始日期不能晚于结束日期。'); return; }
     setBusy(true); setError('');
     try {
-      await api<Run>(`/sources/${source.id}/run`, { method: 'POST', body: JSON.stringify({ startDate, endDate }) });
+      const request: CollectionRequest = mode === 'range' ? { mode, startDate, endDate } : { mode };
+      await api<Run>(`/sources/${source.id}/run`, { method: 'POST', body: JSON.stringify(request) });
       onStarted();
     } catch (e) { setError((e as Error).message); }
     finally { setBusy(false); }
   };
-  return <Modal title={`采集更新 · ${source.name}`} onClose={close}><form onSubmit={submit}>
+  return <Modal title={`开始采集 · ${source.name}`} onClose={close}><form onSubmit={submit}>
     <div className="modal-body">
-      <p className="form-intro">默认仅采集今天。按源站更新时间筛选，开始和结束日期均包含在内；采集区间内的全部影片及其播放页，结果自动保存到本地资料库。</p>
+      <p className="form-intro">本次可临时调整采集范围，源的默认设置保持不变。采集结果自动保存到资料库。</p>
       {error && <div className="inline-error" role="alert">{error}</div>}
       {loading ? <div className="loading-state"><Spinner />正在读取采集时区…</div> : timezone && <>
-        <div className="collection-date-heading"><span><Clock3 size={14} />{timezone}</span><button type="button" className="text-button" disabled={busy} onClick={() => resetToday(timezone)}>重置为今天</button></div>
-        <div className="form-grid"><Field label="开始日期"><input type="date" value={startDate} max={endDate || undefined} required disabled={busy} onChange={e => setStartDate(e.target.value)} /></Field><Field label="结束日期"><input type="date" value={endDate} min={startDate || undefined} required disabled={busy} onChange={e => setEndDate(e.target.value)} /></Field></div>
-        <div className="subtle-note"><Database size={14} /><span>此模式不受页数、影片数和播放页数量上限限制。重复采集会更新已有记录，长任务可在“任务记录”查看进度或取消。</span></div>
+        <div className="collection-date-heading"><span><Clock3 size={14} />{timezone}</span></div>
+        <CollectionScope mode={mode} onModeChange={value => { setMode(value); setError(''); }} html={source.adapter === 'html'} startDate={startDate} endDate={endDate} onStartDate={setStartDate} onEndDate={setEndDate} disabled={busy} />
+        <div className="subtle-note"><Database size={14} /><span>重复采集会更新已有记录，长任务可在“任务记录”查看进度或取消。</span></div>
       </>}
     </div>
     <div className="modal-actions"><button type="button" className="button secondary" disabled={busy} onClick={close}>取消</button><button className="button primary" disabled={loading || !timezone || busy}>{busy ? <Spinner /> : <Play size={15} />}开始采集</button></div>
@@ -218,14 +238,61 @@ function CollectionModal({ source, onClose, onStarted }: { source: Source; onClo
 }
 
 function SourceModal({ source, onClose, onSaved }: { source: Source | 'new'; onClose: () => void; onSaved: () => void }) {
-  const [form, setForm] = useState<Partial<Source>>(source === 'new' ? { name: '', baseUrl: '', adapter: 'html', enabled: true, collectionMode: 'all', updatesSortedDescending: false, listPath: '/', detailLinkSelector: 'a[href*="/voddetail/"]', titleSelector: 'h1', posterSelector: '.module-item-pic img, .vodlist_thumb img', descriptionSelector: '.module-info-introduction, .vod_content', resourceSelector: 'a[href*="/vodplay/"], a[href$=".m3u8"]', nextPageSelector: 'a[title="下一页"]', jsonItemsPath: 'list', jsonTitleField: 'vod_name', jsonUrlField: 'vod_play_url', requestIntervalMs: 2500, maxPages: 2, maxItems: 30, maxResourcePages: 30, respectRobots: true, referer: '' } : source);
+  const [form, setForm] = useState<Partial<Source>>(() => source === 'new' ? {
+    name: '', baseUrl: '', adapter: 'html', enabled: true, collectionMode: 'all', updatesSortedDescending: false,
+    listPath: '/', detailLinkSelector: 'a[href*="/voddetail/"]', titleSelector: 'h1', posterSelector: '.module-item-pic img, .vodlist_thumb img',
+    descriptionSelector: '.module-info-introduction, .vod_content', resourceSelector: 'a[href*="/vodplay/"], a[href$=".m3u8"]',
+    nextPageSelector: 'a[title="下一页"]', jsonItemsPath: 'list', jsonTitleField: 'vod_name', jsonUrlField: 'vod_play_url', requestIntervalMs: 2500,
+  } : { ...source, collectionMode: collectionMode(source) });
   const [saving, setSaving] = useState(false); const [error, setError] = useState('');
   const update = <K extends keyof Source>(key: K, value: Source[K]) => setForm(previous => ({ ...previous, [key]: value }));
-  const submit = async (event: FormEvent) => { event.preventDefault(); if (![form.maxPages, form.maxItems, form.maxResourcePages ?? 30].every(value => Number.isSafeInteger(value) && Number(value) >= 0)) { setError('采集上限须为不小于 0 的安全整数，0 表示不限。'); return; } setSaving(true); setError(''); try { await api(source === 'new' ? '/sources' : `/sources/${source.id}`, { method: source === 'new' ? 'POST' : 'PUT', body: JSON.stringify(form) }); onSaved(); } catch (e) { setError((e as Error).message); } finally { setSaving(false); } };
-  return <Modal title={source === 'new' ? '添加采集源' : `编辑 · ${source.name}`} onClose={onClose}><form onSubmit={submit}><div className="modal-body"><p className="form-intro">设置网站入口和解析方式。按日期采集适用于详情页提供更新时间的 HTML 源；其他源可先限制少量内容验证配置。</p>{error && <div className="inline-error" role="alert">{error}</div>}<div className="form-grid"><Field label="源名称"><input value={form.name} required maxLength={100} placeholder="例如：我的影视源" onChange={e => update('name', e.target.value)} /></Field><Field label="解析方式"><select value={form.adapter} onChange={e => { update('adapter', e.target.value as Source['adapter']); if (e.target.value !== 'html') update('collectionMode', 'all'); }}><option value="html">HTML 页面</option><option value="maccms">MacCMS JSON API</option><option value="json">通用 JSON API</option></select></Field><Field label="网站入口" hint="域名变更后修改这里，已入库资料继续保留。" full><input type="url" value={form.baseUrl} placeholder="https://example.com" required onChange={e => update('baseUrl', e.target.value)} /></Field><Field label="列表路径" hint={form.adapter === 'maccms' ? '例如 /api.php/provide/vod/，接口应支持公开的 detail 列表。' : '相对于网站入口的路径，例如 / 或 /vodshow/1.html。'} full><input value={form.listPath} onChange={e => update('listPath', e.target.value)} required /></Field>
-        {form.adapter === 'html' && <><Field label="采集范围" hint="日期筛选使用源站当前显示的更新时间，默认只获取今天。" full><select value={form.collectionMode ?? 'all'} onChange={e => update('collectionMode', e.target.value as Source['collectionMode'])}><option value="all">全部列表（使用数量上限）</option><option value="updates">按更新日期（默认今天，可选区间）</option></select></Field>{form.collectionMode === 'updates' && <div className="field full"><div className="collection-sort-setting"><div><strong>列表按更新时间倒序</strong><small>仅当列表保证从新到旧排列时启用；遇到早于开始日期的影片后停止翻页。</small></div><Toggle label="列表按更新时间倒序" checked={form.updatesSortedDescending ?? false} onChange={value => update('updatesSortedDescending', value)} /></div></div>}<Field label="详情链接选择器" full><input value={form.detailLinkSelector} onChange={e => update('detailLinkSelector', e.target.value)} required /></Field><Field label="标题选择器"><input value={form.titleSelector} onChange={e => update('titleSelector', e.target.value)} required /></Field><Field label="海报选择器"><input value={form.posterSelector} onChange={e => update('posterSelector', e.target.value)} /></Field><Field label="简介选择器" full><input value={form.descriptionSelector} onChange={e => update('descriptionSelector', e.target.value)} /></Field><Field label="播放链接选择器" full hint="支持直接 m3u8 链接及公开播放页中的播放器地址。"><input value={form.resourceSelector} onChange={e => update('resourceSelector', e.target.value)} /></Field><Field label="下一页选择器" full><input value={form.nextPageSelector} onChange={e => update('nextPageSelector', e.target.value)} /></Field></>}
-        {form.adapter === 'json' && <><Field label="数组所在路径" full><input value={form.jsonItemsPath} onChange={e => update('jsonItemsPath', e.target.value)} placeholder="data.list" /></Field><Field label="片名字段"><input value={form.jsonTitleField} onChange={e => update('jsonTitleField', e.target.value)} required /></Field><Field label="资源 URL 字段"><input value={form.jsonUrlField} onChange={e => update('jsonUrlField', e.target.value)} required /></Field></>}
-        <Field label="请求间隔（毫秒）"><input type="number" min={1000} max={60000} step={100} value={form.requestIntervalMs} onChange={e => update('requestIntervalMs', +e.target.value)} required /></Field><Field label="最多页数" hint={form.collectionMode === 'updates' ? '按日期模式自动读取范围内全部内容，此上限不生效。' : '0 表示不限，自动读取至列表结束。'}><input disabled={form.collectionMode === 'updates'} type="number" min={0} step={1} value={form.maxPages} onChange={e => update('maxPages', +e.target.value)} required /></Field><Field label="最多影片数" hint={form.collectionMode === 'updates' ? '按日期模式不限制影片数量。' : '0 表示不限，不限制本次采集影片数。'}><input disabled={form.collectionMode === 'updates'} type="number" min={0} step={1} value={form.maxItems} onChange={e => update('maxItems', +e.target.value)} required /></Field>{form.adapter === 'html' && <Field label="每部影片每次最多新请求的播放页" hint={form.collectionMode === 'updates' ? '按日期模式采集全部播放页，此上限不生效。' : '0 表示不限；默认 30。已缓存播放页复用不计入上限，与测速抽样分片数量分别配置。'} full><input disabled={form.collectionMode === 'updates'} type="number" min={0} step={1} value={form.maxResourcePages ?? 30} onChange={e => update('maxResourcePages', +e.target.value)} required /></Field>}<Field label="Referer（可选）"><input type="url" value={form.referer} placeholder="留空使用来源页面" onChange={e => update('referer', e.target.value)} /></Field></div><div className="setting-toggle-row compact"><div><strong>启用此采集源</strong><small>启用后纳入每日定时任务；暂停后仍可手动采集。</small></div><Toggle label="启用此采集源" checked={form.enabled ?? true} onChange={value => update('enabled', value)} /></div><div className="setting-toggle-row compact"><div><strong>遵守 robots.txt</strong><small>遇到访问限制或验证码时保留错误供检查。</small></div><Toggle label="遵守robots.txt" checked={form.respectRobots ?? true} onChange={value => update('respectRobots', value)} /></div></div><div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>取消</button><button className="button primary" disabled={saving}>{saving ? <Spinner /> : <Check size={16} />}保存采集源</button></div></form></Modal>;
+  const mode = collectionMode(form);
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (mode === 'range' && !validDateRange(form.startDate || '', form.endDate || '')) { setError('请选择有效的日期区间，开始日期不能晚于结束日期。'); return; }
+    setSaving(true); setError('');
+    try {
+      const input = { ...form, collectionMode: mode, startDate: mode === 'range' ? form.startDate : undefined, endDate: mode === 'range' ? form.endDate : undefined, referer: '' };
+      await api(source === 'new' ? '/sources' : `/sources/${source.id}`, { method: source === 'new' ? 'POST' : 'PUT', body: JSON.stringify(input) });
+      onSaved();
+    } catch (e) { setError((e as Error).message); }
+    finally { setSaving(false); }
+  };
+  const adapterDescription = form.adapter === 'maccms' ? '适用于 MacCMS 标准影视接口，自动读取影片资料和播放线路。' : form.adapter === 'json' ? '适用于自定义 JSON 接口，通过字段映射读取影片和资源。' : '适用于 555 影视等公开网页，通过 CSS 选择器读取影片资料和播放页。';
+  return <Modal title={source === 'new' ? '添加采集源' : `编辑 · ${source.name}`} onClose={onClose}><form onSubmit={submit}>
+    <div className="modal-body">
+      <p className="form-intro">设置网站入口、解析方式和默认采集范围。</p>
+      {error && <div className="inline-error" role="alert">{error}</div>}
+      <div className="form-grid">
+        <Field label="源名称"><input value={form.name} required maxLength={100} placeholder="例如：我的影视源" onChange={e => update('name', e.target.value)} /></Field>
+        <Field label="解析方式"><select value={form.adapter} onChange={e => {
+          const adapter = e.target.value as Source['adapter'];
+          setForm(previous => ({ ...previous, adapter, ...(adapter !== 'html' ? { collectionMode: 'all', startDate: undefined, endDate: undefined } : {}) }));
+          setError('');
+        }}><option value="html">HTML 页面</option><option value="maccms">MacCMS JSON API</option><option value="json">通用 JSON API</option></select></Field>
+        <p className="adapter-description">{adapterDescription}</p>
+        <Field label="网站入口" hint="域名变更后修改这里，已入库资料继续保留。" full><input type="url" value={form.baseUrl} placeholder="https://example.com" required onChange={e => update('baseUrl', e.target.value)} /></Field>
+        <Field label="列表路径" hint={form.adapter === 'maccms' ? '例如 /api.php/provide/vod/，接口应支持公开的 detail 列表。' : '相对于网站入口的路径，例如 / 或 /vodshow/1.html。'} full><input value={form.listPath} onChange={e => update('listPath', e.target.value)} required /></Field>
+        <div className="field full"><CollectionScope mode={mode} onModeChange={value => { update('collectionMode', value); setError(''); }} html={form.adapter === 'html'} startDate={form.startDate || ''} endDate={form.endDate || ''} onStartDate={value => update('startDate', value)} onEndDate={value => update('endDate', value)} disabled={saving} /></div>
+        {form.adapter === 'html' && <>
+          {mode !== 'all' && <div className="field full"><div className="collection-sort-setting"><div><strong>列表按更新时间倒序</strong><small>仅当列表保证从新到旧排列时启用；遇到早于开始日期的影片后停止翻页。</small></div><Toggle label="列表按更新时间倒序" checked={form.updatesSortedDescending ?? false} onChange={value => update('updatesSortedDescending', value)} /></div></div>}
+          <Field label="详情链接选择器" full><input value={form.detailLinkSelector} onChange={e => update('detailLinkSelector', e.target.value)} required /></Field>
+          <Field label="标题选择器"><input value={form.titleSelector} onChange={e => update('titleSelector', e.target.value)} required /></Field>
+          <Field label="海报选择器"><input value={form.posterSelector} onChange={e => update('posterSelector', e.target.value)} /></Field>
+          <Field label="简介选择器" full><input value={form.descriptionSelector} onChange={e => update('descriptionSelector', e.target.value)} /></Field>
+          <Field label="播放链接选择器" full hint="支持直接 m3u8 链接及公开播放页中的播放器地址。"><input value={form.resourceSelector} onChange={e => update('resourceSelector', e.target.value)} /></Field>
+          <Field label="下一页选择器" full><input value={form.nextPageSelector} onChange={e => update('nextPageSelector', e.target.value)} /></Field>
+        </>}
+        {form.adapter === 'json' && <>
+          <Field label="数组所在路径" full><input value={form.jsonItemsPath} onChange={e => update('jsonItemsPath', e.target.value)} placeholder="data.list" /></Field>
+          <Field label="片名字段"><input value={form.jsonTitleField} onChange={e => update('jsonTitleField', e.target.value)} required /></Field>
+          <Field label="资源 URL 字段"><input value={form.jsonUrlField} onChange={e => update('jsonUrlField', e.target.value)} required /></Field>
+        </>}
+        <Field label="请求间隔（毫秒）"><input type="number" min={1000} max={60000} step={100} value={form.requestIntervalMs} onChange={e => update('requestIntervalMs', +e.target.value)} required /></Field>
+      </div>
+    </div>
+    <div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>取消</button><button className="button primary" disabled={saving}>{saving ? <Spinner /> : <Check size={16} />}保存采集源</button></div>
+  </form></Modal>;
 }
 
 function Runs({ revision }: { revision: number }) {

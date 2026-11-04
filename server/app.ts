@@ -7,7 +7,6 @@ import type { Store } from './store.js';
 import { Worker, WorkerRequestError } from './worker.js';
 import { sourceDefaults } from './defaults.js';
 import { collectionRequestSchema, sourceSchema, settingsSchema } from './validation.js';
-import { resolveDateRange } from './dates.js';
 import { nextScheduledAt } from './scheduler.js';
 import { playbackRouter } from './playback.js';
 import { posterDirectory } from './posters.js';
@@ -97,10 +96,6 @@ export function createApp(store: Store, worker: Worker) {
     const source = store.state.sources.find(item => item.id === req.params.id);
     if (!source) { res.status(404).json({ error: '采集源不存在' }); return; }
     const request = collectionRequestSchema.parse(req.body ?? {});
-    if (source.collectionMode === 'updates') {
-      try { resolveDateRange(request, store.state.settings.timezone); }
-      catch (error) { res.status(400).json({ error: error instanceof Error ? error.message : '日期范围无效' }); return; }
-    }
     const run = worker.enqueue(source, request); await store.save(); res.status(202).json(run);
   }));
   app.get('/api/runs', (_req, res) => res.json(store.state.runs));

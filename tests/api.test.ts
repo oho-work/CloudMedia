@@ -276,7 +276,7 @@ test('API, collector, worker, HLS probing and file persistence work together', {
     for (const body of [{ startDate: '2026-02-30', endDate: '2026-03-01' }, { startDate: '2026-11-04', endDate: '2026-11-03' }, { startDate: 123 }, { unknown: true }]) {
       assert.equal((await request(`/api/sources/${queuedSource.id}/run`, 'POST', body)).status, 400);
     }
-    assert.equal((await request(`/api/sources/${activeSource.id}/run`, 'POST', { startDate: '2026-11-03', endDate: '2026-11-03' })).status, 400);
+    assert.equal((await request(`/api/sources/${activeSource.id}/run`, 'POST', { startDate: '2026-11-03', endDate: '2026-11-03' })).status, 409);
     assert.equal(store!.state.runs.length, beforeInvalid, 'invalid requests must never create tasks');
     const queued = await request(`/api/sources/${queuedSource.id}/run`, 'POST');
     assert.equal(queued.status, 202); assert.equal(queued.body.status, 'queued');

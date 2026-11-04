@@ -14,7 +14,7 @@ function storedState(): State {
       posterSelector: '.module-item-pic img, .vodlist_thumb img', descriptionSelector: '.module-info-introduction, .vod_content',
       resourceSelector: 'a[href*="/vodplay/"], a[href$=".m3u8"]', nextPageSelector: 'a[title="下一页"]',
       jsonItemsPath: 'list', jsonTitleField: 'vod_name', jsonUrlField: 'vod_play_url',
-      requestIntervalMs: 2500, maxPages: 2, maxItems: 30, maxResourcePages: 30, respectRobots: true,
+      requestIntervalMs: 2500, maxPages: 0, maxItems: 0, maxResourcePages: 0, respectRobots: false,
       referer: '', createdAt: timestamp, lastRunAt: null, lastError: null,
       collectionMode: 'all', updatesSortedDescending: false,
     }],
@@ -106,6 +106,7 @@ test('PostgreSQL startup persists legacy defaults and interrupted pending runs o
   const data = storedState();
   delete data.sources[0].collectionMode;
   delete data.sources[0].updatesSortedDescending;
+  Object.assign(data.sources[0], { maxPages: 2, maxItems: 30, maxResourcePages: 30, respectRobots: true, referer: 'https://custom.example/' });
   data.runs.push({ ...data.runs[0], id: 'queued', status: 'queued', finishedAt: null },
     { ...data.runs[0], id: 'running', status: 'running', finishedAt: null });
   const { store, upserts } = await loadPostgres(t, data);
@@ -114,6 +115,11 @@ test('PostgreSQL startup persists legacy defaults and interrupted pending runs o
   ]);
   assert.equal(upserts[0].data.collectionMode, 'all');
   assert.equal(upserts[0].data.updatesSortedDescending, false);
+  assert.equal(upserts[0].data.maxPages, 0);
+  assert.equal(upserts[0].data.maxItems, 0);
+  assert.equal(upserts[0].data.maxResourcePages, 0);
+  assert.equal(upserts[0].data.respectRobots, false);
+  assert.equal(upserts[0].data.referer, '');
   for (const row of upserts.filter(row => row.table === 'runs')) {
     assert.equal(row.data.status, 'interrupted');
     assert.ok(typeof row.data.finishedAt === 'string' && Number.isFinite(Date.parse(row.data.finishedAt)));

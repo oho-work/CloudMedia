@@ -4,15 +4,15 @@ import { after, before, test } from 'node:test';
 import type { AddressInfo } from 'node:net';
 import { gzipSync } from 'node:zlib';
 import type { CollectedMovie } from '../shared/types.js';
-import { collectSource, extractPlayerUrls, orderPlaybackPages, parseHtmlMovie, parseJsonMovie, parsePlayUrls, parseRobots, resolvePlaybackPage, robotsAllows } from '../server/collector.js';
+import { collectSource, extractPlayerUrls, orderPlaybackPages, parseHtmlMovie, parseJsonMovie, parsePlayUrls, resolvePlaybackPage } from '../server/collector.js';
 import { defaultSettings, sourceDefaults } from '../server/defaults.js';
 import { isPublicAddress, readTextLimited, safeFetch, safeUrlLabel } from '../server/upstream.js';
 
 let origin = '';
+let previousPrivate: string | undefined;
 const calls: string[] = [];
 const server = createServer((request, response) => {
   const url = new URL(request.url!, 'http://localhost'); calls.push(url.pathname);
-  if (url.pathname === '/robots.txt') return response.end('User-agent: *\nDisallow: /blocked\n');
   if (url.pathname === '/list') return response.end('<a href="/voddetail/1">movie</a><a href="/voddetail/1">duplicate</a>');
   if (url.pathname === '/list-partial') return response.end('<a href="/voddetail/2">movie</a>');
   if (url.pathname === '/list-latest') return response.end('<a href="/voddetail/3">long series</a>');
@@ -58,26 +58,16 @@ const server = createServer((request, response) => {
   if (url.pathname === '/api') return response.end(JSON.stringify({ pagecount: 1, list: [{ vod_id: 7, vod_name: 'API电影', vod_year: '2025', vod_play_from: '公开源', vod_play_url: '正片$https://cdn.example.org/index.m3u8' }] }));
   if (url.pathname === '/forbidden') { response.writeHead(403); return response.end('Denied'); }
   if (url.pathname === '/challenge') return response.end('<title>Bot detection</title><div id="xcdn-captcha">人机验证</div>');
-  if (url.pathname === '/redirect-blocked') { response.writeHead(302, { location: '/blocked' }); return response.end(); }
   if (url.pathname === '/gzip') { response.setHeader('content-encoding', 'gzip'); return response.end(gzipSync('压缩页面')); }
   if (url.pathname === '/large') return response.end('x'.repeat(2048));
   if (url.pathname === '/slow') { response.write('start'); setTimeout(() => response.end('end'), 300); return; }
   response.writeHead(404); response.end();
 });
 
-before(async () => { process.env.ALLOW_PRIVATE_UPSTREAM = 'true'; await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve)); origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`; });
-after(async () => { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); delete process.env.ALLOW_PRIVATE_UPSTREAM; });
+before(async () => { previousPrivate = process.env.ALLOW_PRIVATE_UPSTREAM; process.env.ALLOW_PRIVATE_UPSTREAM = 'true'; await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve)); origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`; });
+after(async () => { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); if (previousPrivate === undefined) delete process.env.ALLOW_PRIVATE_UPSTREAM; else process.env.ALLOW_PRIVATE_UPSTREAM = previousPrivate; });
 const context = (logs: string[] = []) => ({ settings: { ...defaultSettings, maxRetries: 0 }, log: (message: string) => logs.push(message) });
 const fixtureSource = (extra: Parameters<typeof sourceDefaults>[0] = {}) => sourceDefaults({ baseUrl: origin, listPath: '/list', requestIntervalMs: 500, maxItems: 1, maxPages: 1, maxResourcePages: 10, ...extra });
-
-test('robots uses specific user-agent groups, allow precedence, wildcard and query anchors', () => {
-  const policy = parseRobots('User-agent: *\nDisallow: /\nUser-agent: CloudMedia\nDisallow: /private/*\nAllow: /private/public\nDisallow: /*?token=secret$\nCrawl-delay: 2', 'CloudMedia/0.1');
-  assert.equal(policy.delayMs, 2000);
-  assert.equal(robotsAllows(policy, new URL('https://example.com/')), true);
-  assert.equal(robotsAllows(policy, new URL('https://example.com/private/a')), false);
-  assert.equal(robotsAllows(policy, new URL('https://example.com/private/public/a')), true);
-  assert.equal(robotsAllows(policy, new URL('https://example.com/a?token=secret')), false);
-});
 
 test('player extraction ignores next episode, handles ordinary URL encodings, and never evaluates scripts', () => {
   const url = 'https://cdn.example.com/movie/index.m3u8?token=a&b=2';
@@ -94,6 +84,7 @@ test('MacCMS channel parsing preserves every episode and excludes wrapper player
   ]);
   const movie = parseJsonMovie({ vod_id: 1, vod_name: '标题', vod_content: '<p>简介</p>', vod_pic: '/p.jpg', vod_play_url: 'https://cdn.example/1.m3u8' }, fixtureSource(), origin);
   assert.equal(movie?.description, '简介'); assert.equal(movie?.poster, origin + '/p.jpg');
+  assert.equal(movie?.resources[0].referer, origin);
 });
 
 test('HTML collection deduplicates detail/play links and preserves stable line and episode identity', async () => {
@@ -108,10 +99,10 @@ test('HTML collection deduplicates detail/play links and preserves stable line a
   assert.ok(movie.resources.every(resource => !resource.url.includes('wrong-next')));
 });
 
-test('per-film playback page cap is honored and reports partial collection', async () => {
+test('legacy per-film playback limits no longer skip pending episodes', async () => {
   const logs: string[] = []; const movies = [];
   for await (const movie of collectSource(fixtureSource({ maxResourcePages: 1 }), context(logs))) movies.push(movie);
-  assert.equal(movies[0].resources.length, 1); assert.ok(logs.some(message => message.includes('前 1 个')));
+  assert.equal(movies[0].resources.length, 3); assert.ok(!logs.some(message => message.includes('前 1 个')));
 });
 
 test('MacCMS collection reads public JSON without requesting unrelated pages', async () => {
@@ -119,11 +110,10 @@ test('MacCMS collection reads public JSON without requesting unrelated pages', a
   assert.equal(movies[0].title, 'API电影'); assert.equal(movies[0].resources[0].name, '公开源');
 });
 
-test('forbidden, challenge and robots-disallowed targets stop rather than bypass protections', async () => {
-  for (const path of ['/forbidden', '/challenge', '/blocked', '/redirect-blocked']) {
-    await assert.rejects(async () => { for await (const _movie of collectSource(fixtureSource({ listPath: path }), context())) {} }, /403|人机验证|robots/);
+test('forbidden and challenge targets stop collection', async () => {
+  for (const path of ['/forbidden', '/challenge']) {
+    await assert.rejects(async () => { for await (const _movie of collectSource(fixtureSource({ listPath: path }), context())) {} }, /403|人机验证/);
   }
-  assert.ok(!calls.includes('/blocked'));
 });
 
 test('upstream blocks private IPs, credentials and non-HTTP URLs and redacts query values in log labels', async () => {
@@ -146,16 +136,16 @@ test('hostname lookup returns the callback shape required by modern Node autoSel
   assert.equal(await readTextLimited(await safeFetch(localhost + '/gzip')), '压缩页面');
 });
 
-test('incremental HTML collection reuses fresh URLs without consuming the new-page budget', async () => {
+test('incremental HTML collection reuses every fresh playback page without requesting it again', async () => {
   const source = fixtureSource({ maxResourcePages: 1 });
   const first = []; for await (const movie of collectSource(source, context())) first.push(movie);
   const cached = first[0].resources; const resolvedAt = cached[0].resolvedAt;
   calls.length = 0;
   const second = []; for await (const movie of collectSource(source, { ...context(), existingResources: () => cached, knownPageUrls: () => cached.map(resource => resource.pageUrl!) })) second.push(movie);
-  assert.equal(second[0].resources.length, 2);
-  assert.equal(second[0].resources[0].resolvedAt, resolvedAt);
+  assert.equal(second[0].resources.length, 3);
+  assert.equal(second[0].resources.find(resource => resource.pageUrl === cached[0].pageUrl)?.resolvedAt, resolvedAt);
   assert.equal(calls.filter(path => path === '/vodplay/1-a-2').length, 0, 'fresh page must not be requested again');
-  assert.equal(calls.filter(path => path === '/vodplay/1-a-1').length, 1, 'next unknown page must progress');
+  assert.equal(calls.filter(path => path.startsWith('/vodplay/')).length, 0, 'all cached pages must be reused');
 });
 
 test('new episodes are resolved before old pages whose cached URLs have expired', async () => {
@@ -164,8 +154,9 @@ test('new episodes are resolved before old pages whose cached URLs have expired'
   for await (const movie of collectSource(fixtureSource({ maxResourcePages: 1 }), {
     ...context(), existingResources: () => [], knownPageUrls: () => [origin + '/vodplay/1-a-1', origin + '/vodplay/1-a-2'],
   })) movies.push(movie);
-  assert.equal(movies[0].resources.length, 1); assert.equal(movies[0].resources[0].name, '蓝光B');
-  assert.ok(calls.includes('/vodplay/1-b-1')); assert.ok(!calls.includes('/vodplay/1-a-1'));
+  assert.equal(movies[0].resources.length, 3); assert.equal(movies[0].resources[0].name, '蓝光B');
+  const playCalls = calls.filter(path => path.startsWith('/vodplay/'));
+  assert.deepEqual(playCalls, ['/vodplay/1-b-1', '/vodplay/1-a-2', '/vodplay/1-a-1']);
 });
 
 test('a stored public player page can be refreshed with a stable page reference and timestamp', async () => {
@@ -200,16 +191,17 @@ test('HTML type classification uses title-specific categories and never mistakes
   assert.equal(classify(html(['剧情', '喜剧'], '<nav><a href="/vodtype/1.html">电影</a><a href="/vodtype/13.html">连续剧</a><a href="/vodtype/4.html">动漫</a></nav>', '13')), '电视剧');
 });
 
-test('latest unknown episode is collected first and later runs fill older missing episodes', async () => {
+test('episodes are collected newest first and later runs request only missing pages', async () => {
   const source = fixtureSource({ listPath: '/list-latest', maxResourcePages: 1 });
   const first = []; for await (const movie of collectSource(source, context())) first.push(movie);
   assert.equal(first[0].resources[0].episode, '第5集');
-  const cached = first[0].resources;
+  assert.deepEqual(first[0].resources.map(resource => resource.episode), ['第5集', '第4集', '第3集', '第2集', '第1集']);
+  const cached = first[0].resources.slice(0, 1);
   calls.length = 0;
   const second = []; for await (const movie of collectSource(source, { ...context(), existingResources: () => cached, knownPageUrls: () => [origin + '/vodplay/3-a-5', origin + '/vodplay/3-a-3'] })) second.push(movie);
-  assert.deepEqual(second[0].resources.map(resource => resource.episode), ['第5集', '第4集']);
+  assert.deepEqual(second[0].resources.map(resource => resource.episode), ['第5集', '第4集', '第2集', '第1集', '第3集']);
   assert.ok(calls.includes('/vodplay/3-a-4'));
-  assert.ok(!calls.includes('/vodplay/3-a-5')); assert.ok(!calls.includes('/vodplay/3-a-3'));
+  assert.ok(!calls.includes('/vodplay/3-a-5')); assert.ok(calls.includes('/vodplay/3-a-3'));
 });
 
 test('episode, issue and valid date labels rank newest first without interpreting quality or line-name numbers', () => {
@@ -223,7 +215,7 @@ test('episode, issue and valid date labels rank newest first without interpretin
   assert.deepEqual(order(['20261301', '20261103', '20261102']), ['20261301', '20261103', '20261102'], 'invalid calendar labels retain their position');
 });
 
-test('zero HTML limits traverse every list page, more than thirty titles and every playback page with checkpoints', { timeout: 45000 }, async () => {
+test('HTML collection traverses every list page, more than thirty titles and every playback page with checkpoints', { timeout: 45000 }, async () => {
   const movies: CollectedMovie[] = []; const firstMovieCheckpoints: number[] = [];
   for await (const movie of collectSource(fixtureSource({ listPath: '/unlimited-list', detailLinkSelector: 'a[href^="/bulkdetail/"]', maxPages: 0, maxItems: 0, maxResourcePages: 0 }), {
     ...context(), onCheckpoint: async movie => { if (movie.externalId === '/bulkdetail/1') firstMovieCheckpoints.push(movie.resources.length); },
@@ -241,7 +233,7 @@ test('unlimited HTML pagination stops an A to B to A loop without refetching lis
   assert.equal(calls.filter(path => path === '/cycle-list-a').length, 1); assert.equal(calls.filter(path => path === '/cycle-list-b').length, 1);
 });
 
-test('zero MacCMS and JSON limits collect all advertised pages and more than thirty unique titles', async () => {
+test('MacCMS and JSON collect all advertised pages and more than thirty unique titles', async () => {
   for (const adapter of ['maccms', 'json'] as const) {
     const movies = []; for await (const movie of collectSource(fixtureSource({ adapter, listPath: '/json-unlimited', maxPages: 0, maxItems: 0 }), context())) movies.push(movie);
     assert.equal(movies.length, 33); assert.equal(new Set(movies.map(movie => movie.externalId)).size, 33);
