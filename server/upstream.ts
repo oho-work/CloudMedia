@@ -89,7 +89,9 @@ export async function safeFetch(value: string | URL, init: RequestInit = {}, opt
       await options.beforeRequest(target);
       deadline += Date.now() - waitingStarted;
     }
+    init.signal?.throwIfAborted();
     const { url, address, addresses } = await validateTarget(target, allowPrivate);
+    init.signal?.throwIfAborted();
     const remaining = deadline - Date.now();
     if (remaining <= 0) throw new Error('上游请求超时');
     const response = await new Promise<Response>((resolve, reject) => {
@@ -116,7 +118,8 @@ export async function safeFetch(value: string | URL, init: RequestInit = {}, opt
           if (content !== undefined) responseHeaders.set(key, Array.isArray(content) ? content.join(', ') : content);
         }
         const status = incoming.statusCode ?? 502;
-        const encoding = incoming.headers['content-encoding'];
+        const bodyless = method === 'HEAD' || [204, 205, 304].includes(status);
+        const encoding = bodyless ? undefined : incoming.headers['content-encoding'];
         const decoder = encoding === 'gzip' ? createGunzip() : encoding === 'br' ? createBrotliDecompress()
           : encoding === 'deflate' ? createInflate() : null;
         const stream = decoder ? incoming.pipe(decoder) : incoming;
@@ -125,8 +128,7 @@ export async function safeFetch(value: string | URL, init: RequestInit = {}, opt
           incoming.on('error', error => decoder.destroy(error));
           decoder.on('close', () => { if (!incoming.complete) incoming.destroy(); });
         }
-        const body = method === 'HEAD' || [204, 205, 304].includes(status)
-          ? null : webBody(stream, incoming);
+        const body = bodyless ? null : webBody(stream, incoming);
         if (!body) incoming.resume();
         const result = new Response(body, { status, headers: responseHeaders });
         Object.defineProperty(result, 'url', { value: url.href });

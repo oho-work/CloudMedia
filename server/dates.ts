@@ -27,7 +27,9 @@ export function sourceDate(value: unknown, timezone = 'Asia/Shanghai'): string |
   if (typeof value !== 'string') return undefined;
   // ISO values carrying an offset represent an instant; bare site dates are local calendar dates.
   if (/^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d{2}:?\d{2})$/i.test(value.trim())) {
-    const date = new Date(value);
+    const timestamp = value.trim();
+    if (!validDate(timestamp.slice(0, 10))) return undefined;
+    const date = new Date(timestamp);
     return Number.isFinite(date.getTime()) ? localMinute(date, timezone).day : undefined;
   }
   const match = value.match(/(?:^|\D)(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})(?:日|\b)/);

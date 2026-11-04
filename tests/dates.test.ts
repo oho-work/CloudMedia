@@ -39,6 +39,14 @@ test('source dates retain local calendar dates and convert offset or Unix timest
   assert.equal(sourceDate('昨天'), undefined);
 });
 
+test('offset source timestamps reject impossible calendar dates before timezone conversion', () => {
+  for (const value of ['2026-02-29T12:00:00Z', '2026-02-30T12:00:00+08:00', '2026-04-31T23:00:00-0500']) {
+    assert.equal(sourceDate(value, 'UTC'), undefined, value);
+  }
+  assert.equal(sourceDate('2024-02-29T23:30:00-05:00', 'UTC'), '2024-03-01');
+  assert.equal(sourceDate(' 2026-11-02T16:00:00Z ', 'Asia/Shanghai'), '2026-11-03');
+});
+
 let origin = '';
 const events: string[] = [];
 const previousPrivate = process.env.ALLOW_PRIVATE_UPSTREAM;

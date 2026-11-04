@@ -42,9 +42,13 @@ export function upsertMovie(state: State, source: Source, input: CollectedMovie)
   for (const entry of input.resources) {
     let url: URL; try { url = new URL(entry.url, source.baseUrl); } catch { continue; }
     if (!['http:', 'https:'].includes(url.protocol)) continue;
-    const existing = state.resources.find(item => item.movieId === movie!.id && item.sourceId === source.id && item.name === entry.name && item.episode === entry.episode);
+    const name = entry.name.trim() || source.name.trim();
+    const episode = entry.episode.trim() || '正片';
+    const existing = state.resources.find(item => item.movieId === movie!.id && item.sourceId === source.id
+      && (item.name.trim() || source.name.trim()) === name && (item.episode.trim() || '正片') === episode);
     if (existing) {
       rememberResource(existing);
+      existing.name = name; existing.episode = episode;
       const resolvedAt = entry.resolvedAt || now;
       if (existing.url !== url.href || existing.resolvedAt !== resolvedAt) { existing.url = url.href; existing.probe = emptyProbe(); }
       existing.referer = entry.referer || source.referer || input.pageUrl;
@@ -54,7 +58,7 @@ export function upsertMovie(state: State, source: Source, input: CollectedMovie)
       rememberResource(existing);
       resources.push(existing);
     } else {
-      const resource: Resource = { id: randomUUID(), movieId: movie.id, sourceId: source.id, name: entry.name || source.name, episode: entry.episode || '正片', url: url.href, referer: entry.referer || source.referer || input.pageUrl, pageUrl: entry.pageUrl, resolvedAt: entry.resolvedAt || now, probe: emptyProbe(), createdAt: now, updatedAt: now };
+      const resource: Resource = { id: randomUUID(), movieId: movie.id, sourceId: source.id, name, episode, url: url.href, referer: entry.referer || source.referer || input.pageUrl, pageUrl: entry.pageUrl, resolvedAt: entry.resolvedAt || now, probe: emptyProbe(), createdAt: now, updatedAt: now };
       state.resources.push(resource); resources.push(resource);
       rememberResource(resource);
     }

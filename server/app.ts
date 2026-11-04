@@ -45,7 +45,12 @@ export function createApp(store: Store, worker: Worker) {
   });
   app.get('/api/movies', (req, res) => {
     const { search = '', type = '', year = '', sourceId = '' } = req.query;
-    const page = Math.max(1, Number(req.query.page) || 1); const limit = Math.max(1, Math.min(100, Number(req.query.limit) || 24));
+    const pageValue = req.query.page ?? '1'; const limitValue = req.query.limit ?? '24';
+    const page = Number(pageValue); const requestedLimit = Number(limitValue);
+    if (typeof pageValue !== 'string' || typeof limitValue !== 'string' || !Number.isSafeInteger(page) || page < 1 || !Number.isSafeInteger(requestedLimit) || requestedLimit < 1) {
+      res.status(400).json({ error: 'page 和 limit 必须是正整数' }); return;
+    }
+    const limit = Math.min(100, requestedLimit);
     const needle = String(search).trim().toLowerCase();
     const movies = store.state.movies.filter(movie => (!needle || `${movie.title} ${movie.originalTitle} ${movie.actors.join(' ')} ${movie.director}`.toLowerCase().includes(needle)) && (!type || movie.type === type) && (!year || movie.year === year) && (!sourceId || movie.sourceRefs.some(ref => ref.sourceId === sourceId))).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
     const counts = new Map<string, number>(); for (const resource of store.state.resources) counts.set(resource.movieId, (counts.get(resource.movieId) || 0) + 1);

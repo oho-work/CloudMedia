@@ -4,6 +4,52 @@ import { initialState, sourceDefaults } from '../server/defaults.js';
 import { upsertMovie } from '../server/catalog.js';
 import { nextScheduledAt, localMinute } from '../server/scheduler.js';
 import { sourceSchema, settingsSchema } from '../server/validation.js';
+import { parseJsonMovie } from '../server/collector.js';
+
+test('empty episode labels from JSON collection keep a stable resource identity', () => {
+  // Lookup and insertion must use the same default episode, including a channel with no episode label.
+  const state = initialState(); const source = sourceDefaults({ name: 'Fixture', baseUrl: 'https://example.com' });
+  const input = parseJsonMovie({ vod_id: 1, vod_name: '电影', vod_play_url: '$https://example.com/video.m3u8' }, source, source.baseUrl)!;
+  const first = upsertMovie(state, source, input).resources[0];
+  const second = upsertMovie(state, source, input).resources[0];
+  assert.equal(state.resources.length, 1);
+  assert.equal(second.id, first.id);
+  assert.equal(second.episode, '正片');
+});
+
+test('resource identity trims names and episode labels before applying defaults', () => {
+  const state = initialState(); const source = sourceDefaults({ name: 'Fixture', baseUrl: 'https://example.com' });
+  const input = { externalId: 'blank', pageUrl: source.baseUrl, title: '电影', resources: [{ name: '  ', episode: '\t', url: 'https://example.com/video.m3u8' }] };
+  const first = upsertMovie(state, source, input).resources[0];
+  const repeated = upsertMovie(state, source, { ...input, resources: [{ ...input.resources[0], name: ' Fixture ', episode: ' 正片 ' }] }).resources[0];
+  assert.equal(state.resources.length, 1);
+  assert.equal(repeated.id, first.id);
+  assert.equal(repeated.name, 'Fixture');
+  assert.equal(repeated.episode, '正片');
+  upsertMovie(state, source, { ...input, resources: [{ ...input.resources[0], name: 'Other line', episode: '第2集' }] });
+  assert.equal(state.resources.length, 2);
+});
+
+for (const [storedName, storedEpisode, name, episode] of [
+  [' Line ', ' 第1集 ', 'Line', '第1集'],
+  [' \t ', ' \t ', 'Fixture', '正片'],
+] as const) {
+  test(`legacy resource labels ${JSON.stringify([storedName, storedEpisode])} retain identity and history when normalized`, () => {
+    // Existing rows written before normalization must match incoming normalized labels.
+    const state = initialState(); const source = sourceDefaults({ name: 'Fixture', baseUrl: 'https://example.com' });
+    const input = { externalId: 'legacy', pageUrl: source.baseUrl, title: '电影', resources: [{ name, episode, url: 'https://example.com/old.m3u8', resolvedAt: '2026-11-01T00:00:00Z' }] };
+    const original = upsertMovie(state, source, input).resources[0];
+    original.name = storedName; original.episode = storedEpisode;
+    Object.assign(original.probe, { status: 'ok', checkedAt: '2026-11-01T00:01:00Z', width: 1280, height: 720 });
+    const updated = upsertMovie(state, source, { ...input, resources: [{ ...input.resources[0], url: 'https://example.com/new.m3u8', resolvedAt: '2026-11-04T00:00:00Z' }] }).resources[0];
+    assert.equal(state.resources.length, 1);
+    assert.equal(updated.id, original.id);
+    assert.equal(updated.name, name);
+    assert.equal(updated.episode, episode);
+    assert.ok(updated.urlHistory?.some(entry => entry.url === 'https://example.com/old.m3u8'));
+    assert.ok(updated.probeHistory?.some(entry => entry.checkedAt === '2026-11-01T00:01:00Z' && entry.width === 1280));
+  });
+}
 
 test('repeat collection updates expiring URLs and preserves movie/resource identity', () => {
   const state = initialState(); const source = sourceDefaults({ baseUrl: 'https://example.com' });

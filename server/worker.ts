@@ -57,14 +57,16 @@ export class Worker {
   private async process() {
     if (this.working || this.stopping) return;
     this.working = true;
+    let activeRun: Run | undefined;
     try {
       while (this.queue.length && !this.stopping) {
         const { source, run } = this.queue.shift()!;
+        activeRun = run;
         const runController = this.runControllers.get(run.id)!;
         const signal = AbortSignal.any([this.controller.signal, runController.signal]);
         run.status = 'running'; run.message = '正在读取源页面';
-        await this.store.save();
         try {
+          await this.store.save();
           const settings = this.store.state.settings;
           const countedMovies = new Set<string>();
           const countedResources = new Set<string>();
@@ -118,10 +120,32 @@ export class Worker {
         run.finishedAt = new Date().toISOString();
         const current = this.store.state.sources.find(item => item.id === source.id);
         if (current) { current.lastRunAt = run.finishedAt; current.lastError = run.status === 'error' ? run.message : null; }
-        await this.store.save();
+        try { await this.store.save(); }
+        catch (error) {
+          run.status = 'error'; run.message = `任务写入失败：${error instanceof Error ? error.message : '未知错误'}`;
+          run.errors.push(run.message);
+          if (current) current.lastError = run.message;
+          // A transient final write must persist an error rather than report an unsaved success.
+          await this.store.save();
+        }
+        activeRun = undefined;
       }
-    } catch (error) { console.error('任务写入失败：', error instanceof Error ? error.message : '未知错误'); }
-    finally { this.working = false; }
+    } catch (error) {
+      const message = `存储写入失败，排队任务已中断：${error instanceof Error ? error.message : '未知错误'}`;
+      console.error(message);
+      for (const { run } of this.queue) {
+        run.status = 'interrupted'; run.finishedAt = new Date().toISOString(); run.message = message; run.errors.push(message);
+        this.runControllers.delete(run.id);
+      }
+      this.queue.length = 0;
+      await this.store.save().catch(() => console.error('任务错误状态保存失败，请检查存储连接'));
+    }
+    finally {
+      if (activeRun) this.runControllers.delete(activeRun.id);
+      this.working = false;
+      // Requests may enqueue a fresh retry while the failure state is being persisted.
+      if (this.queue.length && !this.stopping) void this.process();
+    }
   }
   probe(resource: Resource, refresh = false, signal = this.controller.signal): Promise<Resource> {
     if (this.stopping) return Promise.reject(new Error('服务正在停止'));
