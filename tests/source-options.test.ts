@@ -29,6 +29,15 @@ test('legacy parser settings become CSS configuration without stale JSON field m
   assert.equal('jsonUrlField' in migrated, false);
 });
 
+test('source concurrency is bounded and legacy configurations default to serial processing', () => {
+  const source = sourceDefaults({ name: 'Fixture', baseUrl: 'https://example.com' });
+  const legacy = { ...source } as Record<string, unknown>; delete legacy.concurrency;
+  assert.equal(sourceSchema.parse(legacy).concurrency, 1);
+  for (const concurrency of [1, 3, 20]) assert.equal(sourceSchema.parse({ ...source, concurrency }).concurrency, concurrency);
+  for (const concurrency of [0, -1, 1.5, 21, '3', null]) assert.equal(sourceSchema.safeParse({ ...source, concurrency }).success, false);
+  assert.equal(sourceDefaults().concurrency, 1);
+});
+
 test('run scope validation accepts today, all and paired date ranges', () => {
   assert.deepEqual(collectionRequestSchema.parse({ mode: 'today' }), { mode: 'today' });
   assert.deepEqual(collectionRequestSchema.parse({ mode: 'all' }), { mode: 'all' });

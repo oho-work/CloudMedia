@@ -13,6 +13,7 @@ export const sourceSchema = z.object({
   listPath: z.string().max(2048), detailLinkSelector: z.string().max(1000), titleSelector: z.string().max(1000),
   posterSelector: z.string().max(1000), descriptionSelector: z.string().max(1000), resourceSelector: z.string().max(1000), nextPageSelector: z.string().max(1000),
   requestIntervalMs: z.number().int().min(0).max(60000),
+  concurrency: z.number().int().min(1).max(20).default(1),
   // Load older saved configurations while ignoring controls that no longer exist.
   maxPages: z.unknown().transform(() => 0), maxItems: z.unknown().transform(() => 0), maxResourcePages: z.unknown().transform(() => 0),
   respectRobots: z.unknown().transform(() => false), referer: z.unknown().transform(() => ''),

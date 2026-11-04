@@ -46,11 +46,42 @@ export function extractPlayerUrls(html: string, base: string, includeAnchors = t
 
 class SourceClient {
   private lastRequest = 0;
-  constructor(private source: Source, private context: CollectionContext) {}
+  private requestStart: Promise<void> = Promise.resolve();
+  private requests = new Set<Promise<unknown>>();
+  readonly limit: number;
+  constructor(private source: Source, private context: CollectionContext, private abort: (reason: unknown) => void = () => {}) {
+    this.limit = Math.max(1, Math.min(20, Math.floor(source.concurrency || 1)));
+  }
+  /** Drain the whole batch before exposing results or propagating its first fatal error. */
+  async settledBatch<T, R>(items: readonly T[], action: (item: T, index: number) => Promise<R>): Promise<PromiseSettledResult<R>[]> {
+    return Promise.allSettled(items.map(async (item, index) => {
+      try { this.context.signal?.throwIfAborted(); return await action(item, index); }
+      catch (error) { this.abort(error); throw error; }
+    }));
+  }
+  async batch<T, R>(items: readonly T[], action: (item: T, index: number) => Promise<R>): Promise<R[]> {
+    const results = await this.settledBatch(items, action);
+    const rejected = results.find(result => result.status === 'rejected');
+    if (rejected?.status === 'rejected') throw this.context.signal?.reason ?? rejected.reason;
+    return results.map(result => (result as PromiseFulfilledResult<R>).value);
+  }
   private headers(referer: string) {
     return { 'user-agent': this.context.settings.userAgent, accept: 'text/html,*/*;q=0.5', referer: new URL(referer).href };
   }
   async get(value: string, referer = this.source.baseUrl): Promise<{ body: string; url: string }> {
+    this.context.signal?.throwIfAborted();
+    while (this.requests.size >= this.limit) {
+      await Promise.race([...this.requests].map(request => request.catch(() => {})));
+      this.context.signal?.throwIfAborted();
+    }
+    const request = this.context.runSourceTask
+      ? this.context.runSourceTask(() => this.request(value, referer), this.context.signal)
+      : this.request(value, referer);
+    this.requests.add(request);
+    try { return await request; }
+    finally { this.requests.delete(request); }
+  }
+  private async request(value: string, referer: string): Promise<{ body: string; url: string }> {
     const url = new URL(value);
     const interval = Math.max(0, this.source.requestIntervalMs);
     for (let attempt = 0; attempt <= this.context.settings.maxRetries; attempt++) {
@@ -58,9 +89,15 @@ class SourceClient {
         const response = await safeFetch(url, { headers: this.headers(referer), signal: this.context.signal }, {
           timeoutMs: 15000 + Math.max(this.source.requestIntervalMs, 0),
           beforeRequest: async () => {
-            const wait = Math.max(0, interval - (Date.now() - this.lastRequest));
-            if (wait) await delay(wait, undefined, { signal: this.context.signal });
-            this.lastRequest = Date.now();
+            const start = this.requestStart.then(async () => {
+              this.context.signal?.throwIfAborted();
+              const wait = Math.max(0, interval - (Date.now() - this.lastRequest));
+              if (wait) await delay(wait, undefined, { signal: this.context.signal });
+              this.context.signal?.throwIfAborted();
+              this.lastRequest = Date.now();
+            });
+            this.requestStart = start.catch(() => {});
+            await start;
           },
         });
         if ([401, 403].includes(response.status)) { await response.body?.cancel(); throw new StopError(`源站返回 HTTP ${response.status}，停止采集，请检查源站访问要求`); }
@@ -76,6 +113,7 @@ class SourceClient {
         if (/cf-chl-|id=["']challenge-form|verify you are human|人机验证|完成安全验证|captcha-container/i.test(body)) throw new StopError('源站要求人机验证，已停止采集');
         return { body, url: response.url || url.href };
       } catch (error) {
+        if (error instanceof StopError) this.abort(error);
         if (error instanceof StopError || error instanceof PageError || this.context.signal?.aborted || attempt >= this.context.settings.maxRetries) throw error;
         this.context.log(`网络请求失败，将退避后重试 (${attempt + 1})`);
         await delay(interval * 2 ** attempt, undefined, { signal: this.context.signal });
@@ -249,34 +287,68 @@ async function populateHtmlResources(plan: HtmlPlan, client: SourceClient, conte
     if (context.onCheckpoint) await context.onCheckpoint(structuredClone({ ...movie, resources: [...resources.values()] }));
   };
   await checkpoint();
-  try { for (const play of orderedPending) {
-    context.signal?.throwIfAborted();
-    context.log(`正在采集「${movie.title}」${play.name} / ${play.episode}（${attemptedPages + 1}/${orderedPending.length} 个播放页）`);
-    try {
-      const content = await client.get(play.url, movie.pageUrl);
-      const urls = extractPlayerUrls(content.body, content.url);
-      if (!urls.length) {
-        const message = `「${movie.title}」${play.name} / ${play.episode} 未发现公开 m3u8，保留影片资料及已有资源`;
-        context.log(message); context.onCollectionError?.(message);
+  try {
+    for (let offset = 0; offset < orderedPending.length; offset += client.limit) {
+      const pages = orderedPending.slice(offset, offset + client.limit);
+      const results = await client.settledBatch(pages, async (play, index) => {
+        context.log(`正在采集「${movie.title}」${play.name} / ${play.episode}（${offset + index + 1}/${orderedPending.length} 个播放页）`);
+        try { return await client.get(play.url, movie.pageUrl); }
+        catch (error) {
+          if (error instanceof StopError || context.signal?.aborted) throw error;
+          return undefined;
+        }
+      });
+      for (let index = 0; index < pages.length; index++) {
+        const result = results[index];
+        if (result.status === 'rejected') continue;
+        const play = pages[index]; const content = result.value;
+        if (content) {
+          const urls = extractPlayerUrls(content.body, content.url);
+          if (!urls.length) {
+            const message = `「${movie.title}」${play.name} / ${play.episode} 未发现公开 m3u8，保留影片资料及已有资源`;
+            context.log(message); context.onCollectionError?.(message);
+          }
+          for (const url of urls) resources.set(`${url}|${play.episode}|${play.name}`, { name: play.name, episode: play.episode, url, referer: content.url, pageUrl: content.url, resolvedAt: new Date().toISOString() });
+        } else {
+          const message = `「${movie.title}」${play.episode} 播放页请求失败，保留影片资料及已有资源：${safeUrlLabel(play.url)}`;
+          context.log(message); context.onCollectionError?.(message);
+        }
+        attemptedPages++;
+        if (attemptedPages % 5 === 0) await checkpoint();
       }
-      for (const url of urls) resources.set(`${url}|${play.episode}|${play.name}`, { name: play.name, episode: play.episode, url, referer: content.url, pageUrl: content.url, resolvedAt: new Date().toISOString() });
-    } catch (error) {
-      if (error instanceof StopError || context.signal?.aborted) {
-        await checkpoint().catch(() => {});
-        throw error;
-      }
-      const message = `「${movie.title}」${play.episode} 播放页请求失败，保留影片资料及已有资源：${safeUrlLabel(play.url)}`;
-      context.log(message); context.onCollectionError?.(message);
+      const rejected = results.find(result => result.status === 'rejected');
+      if (rejected?.status === 'rejected') throw context.signal?.reason ?? rejected.reason;
+      context.signal?.throwIfAborted();
     }
-    attemptedPages++;
-    if (attemptedPages % 5 === 0) await checkpoint();
-  } } finally { await checkpoint(); }
+  } finally { await checkpoint(); }
   movie.resources = [...resources.values()];
   if (!movie.resources.length) context.log(`「${movie.title}」未发现公开 m3u8 地址，已保留影片资料`);
   return movie;
 }
 
 export async function* collectSource(source: Source, context: CollectionContext): AsyncGenerator<CollectedMovie> {
+  const controller = new AbortController();
+  const parentSignal = context.signal;
+  const abort = () => controller.abort(parentSignal?.reason);
+  if (parentSignal?.aborted) abort();
+  else parentSignal?.addEventListener('abort', abort, { once: true });
+  const writeCheckpoint = context.onCheckpoint;
+  let checkpoints: Promise<void> = Promise.resolve();
+  context = { ...context, signal: controller.signal, onCheckpoint: writeCheckpoint ? movie => {
+    const snapshot = structuredClone(movie);
+    const write = checkpoints.then(() => writeCheckpoint(snapshot)).catch(error => { controller.abort(error); throw error; });
+    checkpoints = write.catch(() => {});
+    return write;
+  } : undefined };
+  try { yield* collectSourcePages(source, context, reason => controller.abort(reason)); }
+  finally {
+    controller.abort();
+    parentSignal?.removeEventListener('abort', abort);
+    await checkpoints;
+  }
+}
+
+async function* collectSourcePages(source: Source, context: CollectionContext, abort: (reason: unknown) => void): AsyncGenerator<CollectedMovie> {
   let dateRange = context.dateRange;
   if (!dateRange) {
     if (source.collectionMode === 'updates' || source.collectionMode === 'today') dateRange = resolveDateRange({}, context.settings.timezone);
@@ -291,7 +363,7 @@ export async function* collectSource(source: Source, context: CollectionContext)
     context = { ...context, dateRange, onCollectionError: message => { incompletePages++; reportError?.(message); } };
     context.log(`采集更新日期 ${dateRange.startDate} 至 ${dateRange.endDate}（${dateRange.timezone}）`);
   }
-  const client = new SourceClient(source, context);
+  const client = new SourceClient(source, context, abort);
   let listingReferer = source.baseUrl;
   let pageUrl = absolute(source.listPath || '/', source.baseUrl);
   if (!pageUrl) throw new Error('源站列表地址无效');
@@ -328,42 +400,57 @@ export async function* collectSource(source: Source, context: CollectionContext)
       throw new Error('未发现影片详情链接，请检查详情链接 CSS 选择器');
     }
     if (!details.size && !dateRange) { context.log('列表没有新的影片链接，已停止翻页'); break; }
-    for (const detailUrl of details) {
-      visited.add(detailUrl);
-      let detail: { body: string; url: string };
-      try { detail = await client.get(detailUrl, response.url); }
-      catch (error) {
-        if (error instanceof StopError || context.signal?.aborted) throw error;
-        if (dateRange) {
-          const message = `详情页请求失败，已记录后继续采集其他影片：${safeUrlLabel(detailUrl)}（${error instanceof Error ? error.message : '请求错误'}）`;
-          context.log(message); context.onCollectionError?.(message); continue;
+    const detailUrls = [...details];
+    for (let offset = 0; offset < detailUrls.length && !reachedStart; offset += client.limit) {
+      const urls = detailUrls.slice(offset, offset + client.limit);
+      const results = await client.batch(urls, async detailUrl => {
+        visited.add(detailUrl);
+        try { return { detail: await client.get(detailUrl, response.url) }; }
+        catch (error) {
+          if (error instanceof StopError || context.signal?.aborted) throw error;
+          return { error };
         }
-        context.log(`详情页请求失败，已跳过：${safeUrlLabel(detailUrl)}`); continue;
-      }
-      const movie = parseHtmlMovie(detail.body, source, detail.url, dateRange?.timezone ?? context.settings.timezone);
-      if (!movie) {
-        if (dateRange) throw new Error(`详情页没有匹配片名，无法完成日期范围采集：${safeUrlLabel(detailUrl)}`);
-        context.log('详情页没有匹配片名，已跳过'); continue;
-      }
-      if (dateRange) {
-        const updatedOn = movie.sourceUpdatedOn;
-        if (!updatedOn) throw new Error(`「${movie.title}」没有有效的源站更新时间，无法按日期筛选`);
-        if (updatedOn < dateRange.startDate) {
-          if (source.updatesSortedDescending) { reachedStart = true; break; }
+      });
+      const plans: HtmlPlan[] = [];
+      // Completion order must never let an older record hide preceding in-range titles.
+      for (let index = 0; index < urls.length; index++) {
+        context.signal?.throwIfAborted();
+        const detailUrl = urls[index]; const result = results[index]; const detail = result.detail;
+        if (!detail) {
+          if (dateRange) {
+            const message = `详情页请求失败，已记录后继续采集其他影片：${safeUrlLabel(detailUrl)}（${result.error instanceof Error ? result.error.message : '请求错误'}）`;
+            context.log(message); context.onCollectionError?.(message);
+          } else context.log(`详情页请求失败，已跳过：${safeUrlLabel(detailUrl)}`);
           continue;
         }
-        if (updatedOn > dateRange.endDate) continue;
+        const movie = parseHtmlMovie(detail.body, source, detail.url, dateRange?.timezone ?? context.settings.timezone);
+        if (!movie) {
+          if (dateRange) throw new Error(`详情页没有匹配片名，无法完成日期范围采集：${safeUrlLabel(detailUrl)}`);
+          context.log('详情页没有匹配片名，已跳过'); continue;
+        }
+        if (dateRange) {
+          const updatedOn = movie.sourceUpdatedOn;
+          if (!updatedOn) throw new Error(`「${movie.title}」没有有效的源站更新时间，无法按日期筛选`);
+          if (updatedOn < dateRange.startDate) {
+            if (source.updatesSortedDescending) { reachedStart = true; break; }
+            continue;
+          }
+          if (updatedOn > dateRange.endDate) continue;
+        }
+        if (visitedMovies.has(movie.externalId)) continue;
+        visitedMovies.add(movie.externalId);
+        const plan = htmlPlan(movie, detail, source);
+        if (dateRange) {
+          // Archive every matching title before long episode/line resolution.
+          await context.onCheckpoint?.(structuredClone(movie));
+          updatePlans.push(plan); count++;
+          context.log(`已发现 ${count} 部日期范围内影片，正在读取影片资料`);
+        } else plans.push(plan);
       }
-      if (visitedMovies.has(movie.externalId)) continue;
-      visitedMovies.add(movie.externalId);
-      const plan = htmlPlan(movie, detail, source);
-      if (dateRange) {
-        // Archive every matching title before long episode/line resolution.
-        await context.onCheckpoint?.(structuredClone(movie));
-        updatePlans.push(plan); count++;
-        context.log(`已发现 ${count} 部日期范围内影片，正在读取影片资料`);
-      } else {
-        yield await populateHtmlResources(plan, client, context); count++;
+      if (plans.length) {
+        const movies = await client.batch(plans, plan => populateHtmlResources(plan, client, context));
+        count += movies.length;
+        for (const movie of movies) { context.signal?.throwIfAborted(); yield movie; }
       }
     }
     if (reachedStart) { context.log('已到达开始日期之前的记录，停止翻页'); break; }
@@ -371,10 +458,13 @@ export async function* collectSource(source: Source, context: CollectionContext)
     const next = nextHref ? absolute(nextHref, response.url) : '';
     pageUrl = next && new URL(next).origin === new URL(response.url).origin && next !== pageUrl ? next : '';
   }
-  for (let index = 0; index < updatePlans.length; index++) {
+  for (let offset = 0; offset < updatePlans.length; offset += client.limit) {
     context.signal?.throwIfAborted();
-    context.log(`已归档 ${updatePlans.length} 部影片资料，补齐第 ${index + 1}/${updatePlans.length} 部播放资源`);
-    yield await populateHtmlResources(updatePlans[index], client, context);
+    const movies = await client.batch(updatePlans.slice(offset, offset + client.limit), (plan, index) => {
+      context.log(`已归档 ${updatePlans.length} 部影片资料，补齐第 ${offset + index + 1}/${updatePlans.length} 部播放资源`);
+      return populateHtmlResources(plan, client, context);
+    });
+    for (const movie of movies) { context.signal?.throwIfAborted(); yield movie; }
   }
   context.log(`本次读取 ${count} 部影片`);
   if (dateRange && incompletePages) throw new Error(`已读取 ${count} 部影片；${incompletePages} 个页面未完整取得内容，详见任务错误，可重新采集补齐`);

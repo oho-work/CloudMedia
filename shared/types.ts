@@ -6,7 +6,7 @@ export interface Source {
   id: string; name: string; baseUrl: string; adapter: Adapter; enabled: boolean;
   listPath: string; detailLinkSelector: string; titleSelector: string; posterSelector: string;
   descriptionSelector: string; resourceSelector: string; nextPageSelector: string;
-  requestIntervalMs: number; maxPages: number; maxItems: number; maxResourcePages: number; respectRobots: boolean;
+  requestIntervalMs: number; concurrency: number; maxPages: number; maxItems: number; maxResourcePages: number; respectRobots: boolean;
   referer: string; createdAt: string; lastRunAt: string | null; lastError: string | null;
   collectionMode?: CollectionMode | 'updates'; updatesSortedDescending?: boolean;
   startDate?: string; endDate?: string;
@@ -62,6 +62,7 @@ export interface CollectedMovie {
 }
 export interface CollectionContext {
   settings: Settings; signal?: AbortSignal;
+  runSourceTask?: <T>(action: () => Promise<T>, signal?: AbortSignal) => Promise<T>;
   dateRange?: DateRange;
   log: (message: string) => void;
   onCollectionError?: (message: string) => void;

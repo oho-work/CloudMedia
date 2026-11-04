@@ -13,7 +13,7 @@ function storedState(): State {
       listPath: '/', detailLinkSelector: 'a[href*="/voddetail/"]', titleSelector: 'h1',
       posterSelector: '.module-item-pic img, .vodlist_thumb img', descriptionSelector: '.module-info-introduction, .vod_content',
       resourceSelector: 'a[href*="/vodplay/"], a[href$=".m3u8"]', nextPageSelector: 'a[title="下一页"]',
-      requestIntervalMs: 2500, maxPages: 0, maxItems: 0, maxResourcePages: 0, respectRobots: false,
+      requestIntervalMs: 2500, concurrency: 1, maxPages: 0, maxItems: 0, maxResourcePages: 0, respectRobots: false,
       referer: '', createdAt: timestamp, lastRunAt: null, lastError: null,
       collectionMode: 'all', updatesSortedDescending: false,
     }],
@@ -105,6 +105,7 @@ test('PostgreSQL startup persists legacy defaults and interrupted pending runs o
   const data = storedState();
   delete data.sources[0].collectionMode;
   delete data.sources[0].updatesSortedDescending;
+  delete (data.sources[0] as Partial<typeof data.sources[0]>).concurrency;
   Object.assign(data.sources[0], { maxPages: 2, maxItems: 30, maxResourcePages: 30, respectRobots: true, referer: 'https://custom.example/',
     adapter: 'json', jsonItemsPath: 'data.list', jsonTitleField: 'name', jsonUrlField: 'url' });
   data.runs.push({ ...data.runs[0], id: 'queued', status: 'queued', finishedAt: null },
@@ -115,6 +116,7 @@ test('PostgreSQL startup persists legacy defaults and interrupted pending runs o
   ]);
   assert.equal(upserts[0].data.collectionMode, 'all');
   assert.equal(upserts[0].data.updatesSortedDescending, false);
+  assert.equal(upserts[0].data.concurrency, 1);
   assert.equal(upserts[0].data.maxPages, 0);
   assert.equal(upserts[0].data.maxItems, 0);
   assert.equal(upserts[0].data.maxResourcePages, 0);

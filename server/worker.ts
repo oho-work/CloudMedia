@@ -8,6 +8,7 @@ import type { Store } from './store.js';
 import { PosterArchiver } from './poster-archive.js';
 import { emptyProbe } from './defaults.js';
 import { resolveDateRange } from './dates.js';
+import { concurrentBatch, TaskLimiter } from './concurrency.js';
 
 export class WorkerRequestError extends Error {
   constructor(message: string, readonly status: 400 | 409) { super(message); }
@@ -37,7 +38,9 @@ export class Worker {
   private controller = new AbortController();
   private runControllers = new Map<string, AbortController>();
   private pendingProbes = new Map<string, Promise<Resource>>();
-  private probeTail: Promise<unknown> = Promise.resolve();
+  private sourceLimiters = new Map<string, TaskLimiter>();
+  private resourceLimiters = new Map<string, { limiter: TaskLimiter; pending: number }>();
+  private frozenSourceLimits = new Map<string, number>();
   private timer?: ReturnType<typeof setInterval>;
   readonly posters: PosterArchiver;
   constructor(private store: Store) { this.posters = new PosterArchiver(store); }
@@ -51,6 +54,8 @@ export class Worker {
     const run: Run = { id: randomUUID(), sourceId: source.id, sourceName: source.name, status: 'queued', startedAt: new Date().toISOString(), finishedAt: null, scanned: 0, added: 0, updated: 0, resourceCount: 0, errors: [], message: '等待采集', ...(dateRange ? { dateRange } : {}) };
     this.store.state.runs.unshift(run);
     const snapshot = structuredClone(source);
+    this.frozenSourceLimits.set(source.id, snapshot.concurrency || 1);
+    this.sourceLimiter(source.id);
     snapshot.collectionMode = dateRange ? 'updates' : 'all';
     snapshot.maxPages = snapshot.maxItems = snapshot.maxResourcePages = 0;
     this.queue.push({ source: snapshot, run });
@@ -67,6 +72,7 @@ export class Worker {
       this.queue = this.queue.filter(item => item.run.id !== id);
       run.status = 'interrupted'; run.finishedAt = new Date().toISOString(); run.message = '用户取消，已保存的采集结果保留';
       this.runControllers.delete(id);
+      this.releaseSourceLimit(run.sourceId);
     } else run.message = '正在取消采集，已保存的结果保留';
     await this.store.save();
     return run;
@@ -80,7 +86,9 @@ export class Worker {
         const { source, run } = this.queue.shift()!;
         activeRun = run;
         const runController = this.runControllers.get(run.id)!;
-        const signal = AbortSignal.any([this.controller.signal, runController.signal]);
+        const cancellation = AbortSignal.any([this.controller.signal, runController.signal]);
+        const processingController = new AbortController();
+        const signal = AbortSignal.any([cancellation, processingController.signal]);
         run.status = 'running'; run.message = '正在读取源页面';
         try {
           await this.store.save();
@@ -100,7 +108,29 @@ export class Worker {
             await this.store.save();
             return result;
           };
-          for await (const input of collectSource(source, { settings, dateRange: run.dateRange, signal, onCollectionError: message => { collectionErrors++; if (run.errors.length < 30) run.errors.push(message); }, log: message => { if (!signal.aborted) run.message = message; }, onCheckpoint: async input => { await persist(input); }, existingResources: externalId => {
+          const processMovie = async (input: CollectedMovie) => {
+            try {
+              signal.throwIfAborted();
+              // Metadata reaches storage before any slow poster download or stream probe.
+              const result = await persist(input);
+              await this.posters.archiveMovie(result.movie, input.poster, input.pageUrl, signal);
+              signal.throwIfAborted();
+              if (this.store.state.settings.probeEnabled) {
+                await concurrentBatch(result.resources, source.concurrency || 1, async resource => {
+                  try {
+                    signal.throwIfAborted();
+                    if (resource.probe.status !== 'pending') return;
+                    run.message = `正在检测「${result.movie.title}」${resource.name} / ${resource.episode}`;
+                    const checked = await this.probe(resource, false, signal);
+                    signal.throwIfAborted();
+                    if (checked.probe.status === 'error' && run.errors.length < 30) run.errors.push(`${resource.episode}：${checked.probe.error}`);
+                  } catch (error) { processingController.abort(error); throw error; }
+                }, signal);
+              }
+            } catch (error) { processingController.abort(error); throw error; }
+          };
+          let batch: CollectedMovie[] = [];
+          for await (const input of collectSource(source, { settings, dateRange: run.dateRange, signal, runSourceTask: (action, taskSignal) => this.sourceLimiter(source.id).run(action, taskSignal), onCollectionError: message => { collectionErrors++; if (run.errors.length < 30) run.errors.push(message); }, log: message => { if (!signal.aborted) run.message = message; }, onCheckpoint: async input => { await persist(input); }, existingResources: externalId => {
             const movie = this.store.state.movies.find(item => item.sourceRefs.some(ref => ref.sourceId === source.id && ref.externalId === externalId));
             if (!movie) return [];
             return this.store.state.resources.filter(item => item.movieId === movie.id && item.sourceId === source.id && item.probe.status !== 'error' && Date.now() - new Date(item.resolvedAt || item.createdAt).getTime() < settings.resourceRefreshHours * 3600000)
@@ -110,30 +140,23 @@ export class Worker {
             return this.store.state.resources.filter(item => item.movieId === movie?.id && item.sourceId === source.id && item.pageUrl).map(item => item.pageUrl!);
           } })) {
             signal.throwIfAborted();
-            // Save each item before probing so slow/broken hosts cannot lose collected metadata.
-            const result = await persist(input);
-            await this.posters.archiveMovie(result.movie, input.poster, input.pageUrl, signal);
-            signal.throwIfAborted();
-            if (this.store.state.settings.probeEnabled) {
-              for (const resource of result.resources) {
-                signal.throwIfAborted();
-                if (resource.probe.status !== 'pending') continue;
-                run.message = `正在检测「${result.movie.title}」${resource.name} / ${resource.episode}`;
-                const checked = await this.probe(resource, false, signal);
-                signal.throwIfAborted();
-                if (checked.probe.status === 'error' && run.errors.length < 30) run.errors.push(`${resource.episode}：${checked.probe.error}`);
-              }
+            batch.push(input);
+            if (batch.length >= (source.concurrency || 1)) {
+              await concurrentBatch(batch, source.concurrency || 1, processMovie, signal);
+              batch = [];
             }
           }
+          await concurrentBatch(batch, source.concurrency || 1, processMovie, signal);
           signal.throwIfAborted();
           run.status = collectionErrors ? 'error' : 'success';
           run.message = `已扫描 ${run.scanned} 部，新增 ${run.added} 部，更新 ${run.updated} 部${collectionErrors ? `；${collectionErrors} 个播放页未取得地址，可重新采集补齐` : ''}`;
         } catch (error) {
-          run.status = signal.aborted ? 'interrupted' : 'error';
-          run.message = signal.aborted ? (this.stopping ? '服务停止，已保存的采集结果保留' : '用户取消，已保存的采集结果保留') : error instanceof Error ? error.message : '采集失败';
-          if (!signal.aborted) run.errors.push(run.message);
+          run.status = cancellation.aborted ? 'interrupted' : 'error';
+          run.message = cancellation.aborted ? (this.stopping ? '服务停止，已保存的采集结果保留' : '用户取消，已保存的采集结果保留') : error instanceof Error ? error.message : '采集失败';
+          if (!cancellation.aborted) run.errors.push(run.message);
         }
         this.runControllers.delete(run.id);
+        this.releaseSourceLimit(source.id);
         run.finishedAt = new Date().toISOString();
         const current = this.store.state.sources.find(item => item.id === source.id);
         if (current) { current.lastRunAt = run.finishedAt; current.lastError = run.status === 'error' ? run.message : null; }
@@ -153,6 +176,7 @@ export class Worker {
       for (const { run } of this.queue) {
         run.status = 'interrupted'; run.finishedAt = new Date().toISOString(); run.message = message; run.errors.push(message);
         this.runControllers.delete(run.id);
+        this.releaseSourceLimit(run.sourceId);
       }
       this.queue.length = 0;
       await this.store.save().catch(() => console.error('任务错误状态保存失败，请检查存储连接'));
@@ -164,20 +188,39 @@ export class Worker {
       if (this.queue.length && !this.stopping) void this.process();
     }
   }
+  private sourceLimiter(sourceId: string): TaskLimiter {
+    const limit = this.frozenSourceLimits.get(sourceId) || this.store.state.sources.find(source => source.id === sourceId)?.concurrency || 1;
+    let limiter = this.sourceLimiters.get(sourceId);
+    if (!limiter) { limiter = new TaskLimiter(limit); this.sourceLimiters.set(sourceId, limiter); }
+    else limiter.setLimit(limit);
+    return limiter;
+  }
+  private releaseSourceLimit(sourceId: string) {
+    this.frozenSourceLimits.delete(sourceId);
+    this.sourceLimiter(sourceId);
+  }
   probe(resource: Resource, refresh = false, signal = this.controller.signal): Promise<Resource> {
     if (this.stopping) return Promise.reject(new Error('服务正在停止'));
     const key = `${resource.id}:${refresh}:${signal === this.controller.signal ? 'manual' : 'run'}`;
     const pending = this.pendingProbes.get(key);
     if (pending) return pending;
-    const task = this.probeTail.then(async () => {
+    const combinedSignal = AbortSignal.any([this.controller.signal, signal]);
+    const sourceLimiter = this.sourceLimiter(resource.sourceId);
+    let serial = this.resourceLimiters.get(resource.id);
+    if (!serial) { serial = { limiter: new TaskLimiter(1), pending: 0 }; this.resourceLimiters.set(resource.id, serial); }
+    serial.pending++;
+    const task = serial.limiter.run(() => sourceLimiter.run(async () => {
       if (this.stopping) throw new Error('服务正在停止');
-      signal.throwIfAborted();
+      combinedSignal.throwIfAborted();
       if (refresh) {
         const source = this.store.state.sources.find(item => item.id === resource.sourceId);
         if (!source || !resource.pageUrl) throw new Error('该资源没有可用的原始播放页，请重新采集来源');
         const movie = this.store.state.movies.find(item => item.id === resource.movieId);
         const detailPage = movie?.sourceRefs.find(reference => reference.sourceId === source.id && reference.pageUrl)?.pageUrl;
-        const resolved = await resolvePlaybackPage(source, resource.pageUrl, { settings: this.store.state.settings, signal, log: () => {} }, detailPage || source.baseUrl);
+        const previousUrl = resource.url, previousResolvedAt = resource.resolvedAt;
+        const resolved = await resolvePlaybackPage(source, resource.pageUrl, { settings: this.store.state.settings, signal: combinedSignal, log: () => {} }, detailPage || source.baseUrl);
+        combinedSignal.throwIfAborted();
+        if (resource.url !== previousUrl || resource.resolvedAt !== previousResolvedAt) return resource;
         const selected = resolved.find(item => item.url === resource.url) || (resolved.length === 1 ? resolved[0] : undefined);
         if (!selected) throw new Error(resolved.length ? '原始页面有多个播放地址，请从采集源重新采集以确认剧集' : '原始页面未发现公开的 m3u8 地址');
         rememberResource(resource);
@@ -185,15 +228,17 @@ export class Worker {
         resource.referer = selected.referer || resource.pageUrl;
         resource.probe = emptyProbe(); rememberResource(resource); await this.store.save();
       }
-      const original = resource.url;
-      const result = await probeResource({ ...resource }, { ...this.store.state.settings }, signal);
-      signal.throwIfAborted();
-      if (resource.url === original) { rememberResource(resource); resource.probe = result; rememberResource(resource); resource.updatedAt = new Date().toISOString(); await this.store.save(); }
+      const original = resource.url, resolvedAt = resource.resolvedAt;
+      const result = await probeResource({ ...resource }, { ...this.store.state.settings }, combinedSignal);
+      combinedSignal.throwIfAborted();
+      if (resource.url === original && resource.resolvedAt === resolvedAt) { rememberResource(resource); resource.probe = result; rememberResource(resource); resource.updatedAt = new Date().toISOString(); await this.store.save(); }
       return resource;
-    });
-    this.probeTail = task.catch(() => {});
+    }, combinedSignal), combinedSignal);
     this.pendingProbes.set(key, task);
-    void task.finally(() => this.pendingProbes.delete(key)).catch(() => {});
+    void task.finally(() => {
+      this.pendingProbes.delete(key);
+      if (--serial.pending === 0) this.resourceLimiters.delete(resource.id);
+    }).catch(() => {});
     return task;
   }
   startScheduler() {
@@ -219,10 +264,10 @@ export class Worker {
   async stop() {
     this.stopping = true; clearInterval(this.timer); this.controller.abort();
     await this.posters.stop();
-    for (const { run } of this.queue) { run.status = 'interrupted'; run.finishedAt = new Date().toISOString(); run.message = '服务停止，排队任务已中断'; this.runControllers.delete(run.id); }
+    for (const { run } of this.queue) { run.status = 'interrupted'; run.finishedAt = new Date().toISOString(); run.message = '服务停止，排队任务已中断'; this.runControllers.delete(run.id); this.releaseSourceLimit(run.sourceId); }
     this.queue.length = 0;
     while (this.working) await new Promise(resolve => setTimeout(resolve, 100));
-    await this.probeTail;
+    await Promise.allSettled([...this.pendingProbes.values()]);
     await this.store.save();
   }
 }

@@ -20,7 +20,7 @@ export function sourceDefaults(input: Partial<Source> = {}): Source {
     listPath: '/', detailLinkSelector: 'a[href*="/voddetail/"]', titleSelector: 'h1',
     posterSelector: '.module-item-pic img, .vodlist_thumb img', descriptionSelector: '.module-info-introduction, .vod_content',
     resourceSelector: 'a[href*="/vodplay/"], a[href$=".m3u8"]', nextPageSelector: 'a[title="下一页"]',
-    requestIntervalMs: 2500,
+    requestIntervalMs: 2500, concurrency: 1,
     createdAt: new Date().toISOString(), lastRunAt: null, lastError: null,
     updatesSortedDescending: bundledUpdates,
     ...normalized,

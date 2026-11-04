@@ -167,7 +167,7 @@ function Sources({ sources, dashboard, onEdit, onRun, onChanged, notify, onError
   };
   return <><div className="page-heading"><div><div className="eyebrow">COLLECTION SOURCES</div><h1>采集源</h1><p>管理内容入口，让最新的电影与剧集自动归档。</p></div><button className="button primary" onClick={() => onEdit('new')}><Plus size={17} />添加采集源</button></div><div className="info-strip"><ShieldCheck size={18} /><span>通过 CSS 选择器采集公开 HTML 页面。域名变化时编辑入口地址，本地影片资料会保留。</span></div>
     <div className="source-summary"><span>{sources.length} 个采集源</span><span><i className="status-dot online" />{dashboard?.enabledSourceCount ?? sources.filter(source => source.enabled).length} 个已启用</span></div>
-    {!sources.length ? <div className="panel empty-small"><Globe2 size={36} /><h3>连接你的第一个内容源</h3><p>设置站点入口和 CSS 选择器，然后手动采集验证结果。</p><button className="button secondary" onClick={() => onEdit('new')}><Plus size={16} />添加采集源</button></div> : <div className="source-grid">{sources.map(source => <article className="source-card" key={source.id}><div className="source-card-head"><span className="source-icon"><Globe2 size={22} /></span><div><h3>{source.name}</h3><span className={`badge ${source.enabled ? 'success' : 'muted'}`}>{source.enabled ? '已启用' : '已暂停'}</span></div><div className="source-toggle"><Toggle checked={source.enabled} label={`${source.name}启用状态`} onChange={() => void mutate(source, 'toggle')} /></div></div><a className="source-url" href={source.baseUrl} target="_blank" rel="noreferrer">{source.baseUrl}<ExternalLink size={12} /></a><div className="source-details"><div><span>解析方式</span><strong>HTML / CSS 选择器</strong></div><div><span>请求间隔</span><strong>{source.requestIntervalMs / 1000} 秒</strong></div><div><span>默认采集范围</span><strong>{collectionMode(source) === 'today' ? '今天' : collectionMode(source) === 'range' ? `${source.startDate || '待设置'} 至 ${source.endDate || '待设置'}` : '全部'}</strong></div><div><span>最近采集</span><strong>{date(source.lastRunAt)}</strong></div></div>{source.lastError && <div className="source-error"><CircleAlert size={13} /><span>{source.lastError}</span></div>}<div className="source-actions"><button className="button secondary" disabled={busy === source.id} onClick={() => void onRun(source)}>{busy === source.id ? <Spinner /> : <Play size={14} />}立即采集</button><button className="text-button" onClick={() => onEdit(source)}><Pencil size={14} />编辑</button><IconButton label={`删除${source.name}`} disabled={busy === source.id} onClick={() => void mutate(source, 'delete')}><Trash2 size={15} /></IconButton></div></article>)}</div>}
+    {!sources.length ? <div className="panel empty-small"><Globe2 size={36} /><h3>连接你的第一个内容源</h3><p>设置站点入口和 CSS 选择器，然后手动采集验证结果。</p><button className="button secondary" onClick={() => onEdit('new')}><Plus size={16} />添加采集源</button></div> : <div className="source-grid">{sources.map(source => <article className="source-card" key={source.id}><div className="source-card-head"><span className="source-icon"><Globe2 size={22} /></span><div><h3>{source.name}</h3><span className={`badge ${source.enabled ? 'success' : 'muted'}`}>{source.enabled ? '已启用' : '已暂停'}</span></div><div className="source-toggle"><Toggle checked={source.enabled} label={`${source.name}启用状态`} onChange={() => void mutate(source, 'toggle')} /></div></div><a className="source-url" href={source.baseUrl} target="_blank" rel="noreferrer">{source.baseUrl}<ExternalLink size={12} /></a><div className="source-details"><div><span>解析方式</span><strong>HTML / CSS 选择器</strong></div><div><span>请求间隔</span><strong>{source.requestIntervalMs / 1000} 秒</strong></div><div><span>并发数</span><strong>{source.concurrency ?? 1}</strong></div><div><span>默认采集范围</span><strong>{collectionMode(source) === 'today' ? '今天' : collectionMode(source) === 'range' ? `${source.startDate || '待设置'} 至 ${source.endDate || '待设置'}` : '全部'}</strong></div><div><span>最近采集</span><strong>{date(source.lastRunAt)}</strong></div></div>{source.lastError && <div className="source-error"><CircleAlert size={13} /><span>{source.lastError}</span></div>}<div className="source-actions"><button className="button secondary" disabled={busy === source.id} onClick={() => void onRun(source)}>{busy === source.id ? <Spinner /> : <Play size={14} />}立即采集</button><button className="text-button" onClick={() => onEdit(source)}><Pencil size={14} />编辑</button><IconButton label={`删除${source.name}`} disabled={busy === source.id} onClick={() => void mutate(source, 'delete')}><Trash2 size={15} /></IconButton></div></article>)}</div>}
   </>;
 }
 
@@ -242,17 +242,19 @@ function SourceModal({ source, onClose, onSaved }: { source: Source | 'new'; onC
     name: '', baseUrl: '', adapter: 'html', enabled: true, collectionMode: 'all', updatesSortedDescending: false,
     listPath: '/', detailLinkSelector: 'a[href*="/voddetail/"]', titleSelector: 'h1', posterSelector: '.module-item-pic img, .vodlist_thumb img',
     descriptionSelector: '.module-info-introduction, .vod_content', resourceSelector: 'a[href*="/vodplay/"], a[href$=".m3u8"]',
-    nextPageSelector: 'a[title="下一页"]', requestIntervalMs: 2500,
-  } : { ...source, collectionMode: collectionMode(source) });
+    nextPageSelector: 'a[title="下一页"]', requestIntervalMs: 2500, concurrency: 1,
+  } : { ...source, collectionMode: collectionMode(source), concurrency: source.concurrency ?? 1 });
   const [saving, setSaving] = useState(false); const [error, setError] = useState('');
   const update = <K extends keyof Source>(key: K, value: Source[K]) => setForm(previous => ({ ...previous, [key]: value }));
   const mode = collectionMode(form);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (mode === 'range' && !validDateRange(form.startDate || '', form.endDate || '')) { setError('请选择有效的日期区间，开始日期不能晚于结束日期。'); return; }
+    const concurrency = form.concurrency ?? 1;
+    if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 20) { setError('并发数必须为 1 至 20 的整数。'); return; }
     setSaving(true); setError('');
     try {
-      const input = { ...form, adapter: 'html', collectionMode: mode, startDate: mode === 'range' ? form.startDate : undefined, endDate: mode === 'range' ? form.endDate : undefined, referer: '' };
+      const input = { ...form, adapter: 'html', concurrency, collectionMode: mode, startDate: mode === 'range' ? form.startDate : undefined, endDate: mode === 'range' ? form.endDate : undefined, referer: '' };
       await api(source === 'new' ? '/sources' : `/sources/${source.id}`, { method: source === 'new' ? 'POST' : 'PUT', body: JSON.stringify(input) });
       onSaved();
     } catch (e) { setError((e as Error).message); }
@@ -277,6 +279,7 @@ function SourceModal({ source, onClose, onSaved }: { source: Source | 'new'; onC
         <Field label="播放链接选择器" full hint="支持直接 m3u8 链接及公开播放页中的播放器地址。"><input value={form.resourceSelector} onChange={e => update('resourceSelector', e.target.value)} /></Field>
         <Field label="下一页选择器" full><input value={form.nextPageSelector} onChange={e => update('nextPageSelector', e.target.value)} /></Field>
         <Field label="请求间隔（秒）" hint="0 表示不额外等待；最多 60 秒，支持三位小数。"><input type="number" min={0} max={60} step={0.001} value={(form.requestIntervalMs ?? 2500) / 1000} onChange={e => update('requestIntervalMs', Math.round(Number(e.target.value) * 1000))} required /></Field>
+        <Field label="并发数" hint="同时获取详情、播放地址和检测分辨率的任务数；1 为串行。"><input type="number" min={1} max={20} step={1} value={form.concurrency ?? 1} onChange={e => update('concurrency', Number(e.target.value))} required /></Field>
       </div>
     </div>
     <div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>取消</button><button className="button primary" disabled={saving}>{saving ? <Spinner /> : <Check size={16} />}保存采集源</button></div>
