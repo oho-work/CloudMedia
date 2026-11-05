@@ -33,8 +33,8 @@ test('source concurrency is bounded and legacy configurations default to serial 
   const source = sourceDefaults({ name: 'Fixture', baseUrl: 'https://example.com' });
   const legacy = { ...source } as Record<string, unknown>; delete legacy.concurrency;
   assert.equal(sourceSchema.parse(legacy).concurrency, 1);
-  for (const concurrency of [1, 3, 20]) assert.equal(sourceSchema.parse({ ...source, concurrency }).concurrency, concurrency);
-  for (const concurrency of [0, -1, 1.5, 21, '3', null]) assert.equal(sourceSchema.safeParse({ ...source, concurrency }).success, false);
+  for (const concurrency of [1, 3, 20, 100]) assert.equal(sourceSchema.parse({ ...source, concurrency }).concurrency, concurrency);
+  for (const concurrency of [0, -1, 1.5, 101, '3', null]) assert.equal(sourceSchema.safeParse({ ...source, concurrency }).success, false);
   assert.equal(sourceDefaults().concurrency, 1);
 });
 

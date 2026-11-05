@@ -36,20 +36,20 @@ test('source concurrency survives API updates and restart while invalid values l
   const created = await request('/api/sources', 'POST', sourceDefaults({ name: 'Fixture', baseUrl: 'https://example.invalid', concurrency: 3, requestIntervalMs: 0 }));
   assert.equal(created.status, 201); const source = await created.json() as Source;
   assert.equal(source.concurrency, 3);
-  for (const concurrency of [0, 21, 1.5, '5', null]) {
+  for (const concurrency of [0, 101, 1.5, '5', null]) {
     const invalid = await request(`/api/sources/${source.id}`, 'PUT', { concurrency });
     assert.equal(invalid.status, 400); await invalid.json();
     assert.equal(store.state.sources.find(item => item.id === source.id)?.concurrency, 3);
   }
-  const updated = await request(`/api/sources/${source.id}`, 'PUT', { concurrency: 20 });
-  assert.equal(updated.status, 200); assert.equal((await updated.json()).concurrency, 20);
+  const updated = await request(`/api/sources/${source.id}`, 'PUT', { concurrency: 100 });
+  assert.equal(updated.status, 200); assert.equal((await updated.json()).concurrency, 100);
   const disk = JSON.parse(await readFile(process.env.DATA_FILE!, 'utf8'));
-  assert.equal(disk.sources.find((item: Source) => item.id === source.id).concurrency, 20);
+  assert.equal(disk.sources.find((item: Source) => item.id === source.id).concurrency, 100);
   await store.close();
   const reloaded = new Store();
   try {
     await reloaded.init();
-    assert.equal(reloaded.state.sources.find(item => item.id === source.id)?.concurrency, 20);
+    assert.equal(reloaded.state.sources.find(item => item.id === source.id)?.concurrency, 100);
     assert.equal(reloaded.state.sources.find(item => item.id === source.id)?.requestIntervalMs, 0);
   } finally { await reloaded.close(); }
 });

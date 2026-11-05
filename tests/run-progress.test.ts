@@ -61,17 +61,22 @@ test('run progress retains complete collection failure counts beyond the bounded
   assert.deepEqual(f.durable().runs[0].progress, run.progress);
 });
 
-test('probe and poster failures are counted by phase without inventing successful measurements', async t => {
+test('collection counts poster failures without requesting broken media under a legacy probe preference', async t => {
+  const mediaRequests: string[] = [];
   const f = await fixture(t, (path, response) => {
+    if (path.endsWith('.m3u8')) mediaRequests.push(path);
     if (path === '/list') return void response.end('<a href="/voddetail/1">movie</a>');
     if (path === '/voddetail/1') return void response.end('<h1>Unavailable</h1><img src="/poster.png"><a href="/gone.m3u8?secret=hidden">正片</a>');
     response.writeHead(404); response.end();
   });
   f.state.sources[0].posterSelector = 'img';
+  f.state.settings.probeEnabled = true;
   const run = f.worker.enqueue(f.state.sources[0]);
   await waitFor(() => Boolean(f.durable().runs.find(item => item.id === run.id)?.finishedAt), 'measurements should settle durably');
-  assert.deepEqual(run.progress?.probes, { queued: 0, active: 0, passed: 0, failed: 1 });
-  assert.deepEqual(run.progress?.failures, { collection: 0, probe: 1, poster: 1, runtime: 0, total: 2 });
+  assert.deepEqual(run.progress?.probes, { queued: 0, active: 0, passed: 0, failed: 0 });
+  assert.deepEqual(run.progress?.failures, { collection: 0, probe: 0, poster: 1, runtime: 0, total: 1 });
+  assert.deepEqual(mediaRequests, []);
+  assert.equal(f.durable().resources[0].probe.status, 'pending');
   assert.equal(run.progress?.completedMovies, 1);
   assert.ok(run.errors.every(message => !message.includes('secret=')));
 });

@@ -93,63 +93,41 @@ async function pipeline(t: TestContext, concurrency: number, count: number, page
     playbackBlocked: () => Boolean(blockedPlayback && !blockedPlayback.writableEnded), peakRequests: () => peakRequests };
 }
 
-test('twenty movie slots refill across pages only after a movie finishes measurements', { timeout: 10000 }, async t => {
-  const f = await pipeline(t, 20, 25, 7);
+test('collection refills movie slots across pages without touching any media even with legacy probes enabled', { timeout: 10000 }, async t => {
+  const f = await pipeline(t, 100, 105, 7);
   const run = f.worker.enqueue(f.state.sources[0]);
-  await waitFor(() => f.probes.length === 20, 'all twenty movies should reach their held measurements');
-  await waitFor(() => f.durable().runs.find(item => item.id === run.id)?.progress?.probes.active === 20, 'live activity should be durably saved even while requests remain held');
-  assert.equal(run.progress?.discoveredMovies, 20);
-  assert.equal(run.progress?.completedMovies, 0);
-  assert.equal(run.progress?.activeMovies, 20);
-  assert.equal(run.progress?.concurrency, 20);
-  assert.equal(run.progress?.activeMovieTitles.length, 20);
-  assert.equal(run.progress?.currentPage, 3);
-  assert.equal(run.progress?.paginationComplete, false, 'the undiscovered later movies must not be represented as a known total');
-  assert.deepEqual(run.progress?.probes, { queued: 4, active: 20, passed: 0, failed: 0 });
-  assert.ok(f.requests.includes('/list/2') && f.requests.includes('/list/3'), 'short first pages must be followed while movie slots remain');
-  assert.equal(f.requests.filter(path => path.startsWith('/voddetail/')).length, 20);
-  assert.equal(f.durable().movies.length, 20);
-  assert.ok(!f.requests.includes('/voddetail/21'), 'saving addresses must not release a movie slot before measurements finish');
-  assert.equal(f.durable().resources.filter(resource => resource.probe.status === 'ok').length, 0);
-
-  f.releaseProbe(2);
-  await waitFor(() => f.requests.includes('/voddetail/21'), 'one completed movie should immediately admit the twenty-first movie');
-  assert.equal(f.requests.filter(path => path.startsWith('/voddetail/')).length, 21);
-  assert.ok(!f.requests.includes('/voddetail/22'));
-  assert.ok(!f.probes.includes('1-2'), 'the long first series still has unfinished measurements');
-  const checked = f.durable().resources.find(resource => resource.url.includes('/probe/2-1.'))!;
-  assert.equal(checked.probe.status, 'ok');
-  assert.equal(checked.probe.width, 1280); assert.equal(checked.probe.height, 720);
-  assert.ok(checked.probe.speedMbps! > 0);
-  assert.ok(f.peakRequests() <= 20, 'movie slots must not multiply the shared network request budget');
-
-  f.release();
   await waitFor(() => f.durable().runs.find(item => item.id === run.id)?.status === 'success', 'all pages and all movies should complete');
-  assert.equal(run.scanned, 25);
-  assert.equal(run.progress?.discoveredMovies, 25);
-  assert.equal(run.progress?.completedMovies, 25);
+  assert.equal(run.scanned, 105);
+  assert.equal(run.progress?.discoveredMovies, 105);
+  assert.equal(run.progress?.completedMovies, 105);
+  assert.equal(run.progress?.concurrency, 100);
   assert.equal(run.progress?.activeMovies, 0);
   assert.deepEqual(run.progress?.activeMovieTitles, []);
   assert.equal(run.progress?.paginationComplete, true);
-  assert.deepEqual(run.progress?.probes, { queued: 0, active: 0, passed: 29, failed: 0 });
+  assert.deepEqual(run.progress?.probes, { queued: 0, active: 0, passed: 0, failed: 0 });
   assert.equal(run.progress?.failures.total, 0);
-  assert.equal(f.durable().resources.length, 29);
-  assert.ok(f.durable().resources.every(resource => resource.probe.status === 'ok'));
+  assert.equal(f.durable().resources.length, 109);
+  assert.ok(f.durable().resources.every(resource => resource.probe.status === 'pending'));
+  assert.deepEqual(f.probes, []);
+  assert.ok(!f.requests.some(path => path.startsWith('/streams/') || path === '/segment.ts'));
+  assert.equal(f.requests.filter(path => path.startsWith('/voddetail/')).length, 105);
+  assert.ok(f.requests.includes('/list/15'));
+  assert.ok(f.peakRequests() <= 100);
 });
 
-test('a resource checkpoint starts measurements before a long movie finishes parsing its playback pages', { timeout: 10000 }, async t => {
+test('resource checkpoints persist pending addresses while independent movies finish without measurements', { timeout: 10000 }, async t => {
   const f = await pipeline(t, 2, 3, 3, true);
   const run = f.worker.enqueue(f.state.sources[0]);
-  await waitFor(() => f.playbackBlocked() && f.probes.includes('1-2'), 'the resolved episode must be probed while its next playback page remains blocked');
+  await waitFor(() => f.playbackBlocked() && f.durable().resources.some(resource => resource.url.includes('/probe/1-2.')), 'resolved addresses must persist while another playback page is still blocked');
   assert.ok(f.playbackBlocked());
-  assert.ok(!f.probes.includes('1-1'));
-  f.releaseProbe(1, 2);
+  assert.deepEqual(f.probes, []);
   await waitFor(() => f.requests.includes('/voddetail/3'), 'a completed second movie must refill while the first movie remains unfinished');
   assert.ok(f.playbackBlocked());
-  assert.equal(f.durable().resources.find(resource => resource.url.includes('/probe/1-2.'))?.probe.status, 'ok');
+  assert.equal(f.durable().resources.find(resource => resource.url.includes('/probe/1-2.'))?.probe.status, 'pending');
   assert.ok(f.peakRequests() <= 2);
   f.release();
-  await waitFor(() => f.durable().runs.find(item => item.id === run.id)?.status === 'success', 'remaining movie parsing and probes must finish');
+  await waitFor(() => f.durable().runs.find(item => item.id === run.id)?.status === 'success', 'remaining playback page parsing must finish');
   assert.equal(f.durable().resources.length, 4);
-  assert.ok(f.durable().resources.every(resource => resource.probe.status === 'ok'));
+  assert.ok(f.durable().resources.every(resource => resource.probe.status === 'pending'));
+  assert.deepEqual(f.probes, []);
 });

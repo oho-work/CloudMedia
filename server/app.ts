@@ -11,6 +11,7 @@ import { nextScheduledAt } from './scheduler.js';
 import { playbackRouter } from './playback.js';
 import { localPosterPath } from '../shared/poster-path.js';
 import { appClock, type AppClock } from './clock.js';
+import { queryLibrary } from './library.js';
 
 const asyncRoute = (handler: (req: Request, res: Response) => Promise<unknown>) => (req: Request, res: Response, next: NextFunction) => { void handler(req, res).catch(next); };
 export function createApp(store: Store, worker: Worker, clock: AppClock = appClock) {
@@ -45,18 +46,7 @@ export function createApp(store: Store, worker: Worker, clock: AppClock = appClo
     res.json(dashboard);
   });
   app.get('/api/movies', (req, res) => {
-    const { search = '', type = '', year = '', sourceId = '' } = req.query;
-    const pageValue = req.query.page ?? '1'; const limitValue = req.query.limit ?? '24';
-    const page = Number(pageValue); const requestedLimit = Number(limitValue);
-    if (typeof pageValue !== 'string' || typeof limitValue !== 'string' || !Number.isSafeInteger(page) || page < 1 || !Number.isSafeInteger(requestedLimit) || requestedLimit < 1) {
-      res.status(400).json({ error: 'page 和 limit 必须是正整数' }); return;
-    }
-    const limit = Math.min(100, requestedLimit);
-    const needle = String(search).trim().toLowerCase();
-    const movies = store.state.movies.filter(movie => (!needle || `${movie.title} ${movie.originalTitle} ${movie.actors.join(' ')} ${movie.director}`.toLowerCase().includes(needle)) && (!type || movie.type === type) && (!year || movie.year === year) && (!sourceId || movie.sourceRefs.some(ref => ref.sourceId === sourceId))).sort((a, b) => b.createdAt.localeCompare(a.createdAt) || a.id.localeCompare(b.id));
-    const counts = new Map<string, number>(); for (const resource of store.state.resources) counts.set(resource.movieId, (counts.get(resource.movieId) || 0) + 1);
-    res.json({ items: movies.slice((page - 1) * limit, page * limit).map(movie => ({ ...movie, poster: localPosterPath(movie.poster), resourceCount: counts.get(movie.id) || 0 })), total: movies.length, page, limit,
-      types: [...new Set(store.state.movies.map(movie => movie.type).filter(Boolean))].sort(), years: [...new Set(store.state.movies.map(movie => movie.year).filter(Boolean))].sort().reverse() });
+    res.json(queryLibrary(store.state, req.query));
   });
   app.get('/api/movies/:id', (req, res) => {
     const movie = store.state.movies.find(item => item.id === req.params.id);
@@ -142,21 +132,15 @@ export function createApp(store: Store, worker: Worker, clock: AppClock = appClo
     const settings = settingsSchema.parse({ ...store.state.settings, ...req.body, ...(legacyDailyTime ? { dailyTimes: [req.body.dailyTime] } : {}) });
     store.state.settings = settings; await store.save(); res.json(settings);
   }));
-  app.post('/api/resources/:id/probe', asyncRoute(async (req, res) => {
+  app.post('/api/resources/:id/check-playback', asyncRoute(async (req, res) => {
     const resource = store.state.resources.find(item => item.id === req.params.id);
     if (!resource) { res.status(404).json({ error: '资源不存在' }); return; }
-    res.json(await worker.probe(resource));
+    res.json({ resources: await worker.checkPlayback(resource) });
   }));
   app.post('/api/resources/:id/refresh', asyncRoute(async (req, res) => {
     const resource = store.state.resources.find(item => item.id === req.params.id);
     if (!resource) { res.status(404).json({ error: '资源不存在' }); return; }
-    res.json(await worker.probe(resource, true));
-  }));
-  app.post('/api/movies/:id/probe', asyncRoute(async (req, res) => {
-    if (!store.state.movies.some(movie => movie.id === req.params.id)) { res.status(404).json({ error: '影片不存在' }); return; }
-    const resources = store.state.resources.filter(item => item.movieId === req.params.id);
-    for (const resource of resources) void worker.probe(resource).catch(() => console.error('资源检测写入失败'));
-    res.status(202).json({ queued: resources.length });
+    res.json(await worker.refreshResource(resource));
   }));
   app.use('/api/play', playbackRouter(store));
   app.use('/api', (_req, res) => res.status(404).json({ error: '接口不存在' }));

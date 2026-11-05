@@ -11,6 +11,7 @@ import { resolveDateRange } from './dates.js';
 import { TaskLimiter } from './concurrency.js';
 import { appClock, type AppClock } from './clock.js';
 import { BEIJING_TIMEZONE, normalizedDailyTimes } from '../shared/schedule-settings.js';
+import { episodeKey } from '../shared/episode.js';
 
 export class WorkerRequestError extends Error {
   constructor(message: string, readonly status: 400 | 409 | 503) { super(message); }
@@ -32,9 +33,12 @@ function collectionRange(source: Source, request: CollectionRequest, timezone: s
 function sameRange(left?: DateRange, right?: DateRange) {
   return left?.startDate === right?.startDate && left?.endDate === right?.endDate && left?.timezone === right?.timezone;
 }
+function nextResourceTimestamp(resource: Resource): string {
+  return new Date(Math.max(Date.now(), (Date.parse(resource.updatedAt) || 0) + 1)).toISOString();
+}
 function initialProgress(concurrency: number): RunProgress {
   return { discoveredMovies: 0, completedMovies: 0, activeMovies: 0,
-    concurrency: Math.max(1, Math.min(20, Math.floor(concurrency || 1))), currentPage: 0, paginationComplete: false,
+    concurrency: Math.max(1, Math.min(100, Math.floor(concurrency || 1))), currentPage: 0, paginationComplete: false,
     activeMovieTitles: [], probes: { queued: 0, active: 0, passed: 0, failed: 0 },
     failures: { collection: 0, probe: 0, poster: 0, runtime: 0, total: 0 } };
 }
@@ -57,6 +61,7 @@ export class Worker {
   private controller = new AbortController();
   private runControllers = new Map<string, AbortController>();
   private pendingProbes = new Map<string, Promise<Resource>>();
+  private pendingPlaybackChecks = new Map<string, Promise<Resource[]>>();
   private sourceLimiters = new Map<string, TaskLimiter>();
   private resourceLimiters = new Map<string, { limiter: TaskLimiter; pending: number }>();
   private frozenSourceLimits = new Map<string, number>();
@@ -168,53 +173,9 @@ export class Worker {
             await this.store.save();
             return result;
           };
-          const movieProbes = new Map<string, { limiter: TaskLimiter; jobs: Map<string, Promise<void>> }>();
-          const activeProbes = new Set<Promise<void>>();
-          const scheduleProbes = (input: CollectedMovie, resources: Resource[]) => {
-            if (!this.store.state.settings.probeEnabled || signal.aborted) return;
-            let queue = movieProbes.get(input.externalId);
-            if (!queue) {
-              queue = { limiter: new TaskLimiter(1), jobs: new Map() };
-              movieProbes.set(input.externalId, queue);
-            }
-            for (const resource of resources) {
-              if (resource.probe.status !== 'pending') continue;
-              const identity = `${resource.id}:${resource.url}:${resource.resolvedAt || ''}`;
-              if (queue.jobs.has(identity)) continue;
-              const originalUrl = resource.url, resolvedAt = resource.resolvedAt;
-              let started = false;
-              progress.probes.queued++; progressChanged();
-              const task = queue.limiter.run(async () => {
-                signal.throwIfAborted();
-                if (resource.url !== originalUrl || resource.resolvedAt !== resolvedAt || resource.probe.status !== 'pending') return;
-                run.message = `正在检测「${input.title}」${resource.name} / ${resource.episode}`;
-                const checked = await this.probe(resource, false, signal, () => {
-                  started = true; progress.probes.queued--; progress.probes.active++; progressChanged();
-                });
-                signal.throwIfAborted();
-                if (checked.probe.status === 'ok') progress.probes.passed++;
-                else if (checked.probe.status === 'error') {
-                  progress.probes.failed++;
-                  recordFailure(run, 'probe', `${input.title} / ${resource.episode}：${checked.probe.error}`);
-                }
-              }, signal).catch(error => { processingController.abort(error); throw error; }).finally(() => {
-                if (started) progress.probes.active--; else progress.probes.queued--;
-                progressChanged();
-              });
-              queue.jobs.set(identity, task); activeProbes.add(task);
-              const pendingQueue = queue;
-              const release = () => {
-                activeProbes.delete(task);
-                if (pendingQueue.jobs.get(identity) === task) pendingQueue.jobs.delete(identity);
-              };
-              void task.then(release, release);
-            }
-          };
           const checkpoint = async (input: CollectedMovie) => {
             try {
-              const result = await persist(input);
-              scheduleProbes(input, result.resources);
-              return result;
+              return await persist(input);
             } catch (error) { processingController.abort(error); throw error; }
           };
           const processMovie = async (input: CollectedMovie) => {
@@ -222,21 +183,13 @@ export class Worker {
               signal.throwIfAborted();
               const result = await checkpoint(input);
               const previousPosterAttempts = result.movie.posterArchive?.attempts || 0;
-              // Incremental probes already run while playback pages are being
-              // resolved. A movie keeps its slot until both tasks finish.
-              const results = await Promise.allSettled([
-                this.posters.archiveMovie(result.movie, input.poster, input.pageUrl, signal),
-                Promise.all(movieProbes.get(input.externalId)?.jobs.values() ?? []),
-              ]);
-              const rejected = results.find(result => result.status === 'rejected');
-              if (rejected?.status === 'rejected') throw rejected.reason;
+              await this.posters.archiveMovie(result.movie, input.poster, input.pageUrl, signal);
               signal.throwIfAborted();
               if (result.movie.posterArchive?.status === 'error' && result.movie.posterArchive.attempts > previousPosterAttempts) {
                 recordFailure(run, 'poster', `${input.title}：${result.movie.posterArchive.error || '海报归档失败'}`);
                 progressChanged();
               }
             } catch (error) { processingController.abort(error); throw error; }
-            finally { movieProbes.delete(input.externalId); }
           };
           try {
             for await (const _input of collectSource(source, {
@@ -261,11 +214,6 @@ export class Worker {
           } catch (error) {
             collectionFailed = !processingController.signal.aborted;
             throw error;
-          } finally {
-            // Checkpoints can have started probes before the generator yields.
-            // Cancellation/failure must drain those jobs before final run save.
-            await Promise.allSettled([...activeProbes]);
-            movieProbes.clear();
           }
           signal.throwIfAborted();
           run.status = collectionErrors ? 'error' : 'success';
@@ -321,7 +269,8 @@ export class Worker {
     }
   }
   private sourceLimiter(sourceId: string): TaskLimiter {
-    const limit = this.frozenSourceLimits.get(sourceId) || this.store.state.sources.find(source => source.id === sourceId)?.concurrency || 1;
+    const configured = this.frozenSourceLimits.get(sourceId) || this.store.state.sources.find(source => source.id === sourceId)?.concurrency || 1;
+    const limit = Math.max(1, Math.min(100, Math.floor(configured)));
     let limiter = this.sourceLimiters.get(sourceId);
     if (!limiter) { limiter = new TaskLimiter(limit); this.sourceLimiters.set(sourceId, limiter); }
     else limiter.setLimit(limit);
@@ -332,8 +281,29 @@ export class Worker {
     this.sourceLimiter(sourceId);
   }
   probe(resource: Resource, refresh = false, signal = this.controller.signal, onStart?: () => void): Promise<Resource> {
+    return this.resourceOperation(resource, refresh, true, signal, onStart);
+  }
+  refreshResource(resource: Resource, signal = this.controller.signal): Promise<Resource> {
+    return this.resourceOperation(resource, true, false, signal);
+  }
+  checkPlayback(resource: Resource): Promise<Resource[]> {
+    const episode = episodeKey(resource.episode);
+    const key = JSON.stringify([resource.movieId, episode]);
+    const pending = this.pendingPlaybackChecks.get(key);
+    if (pending) return pending;
+    const resources = this.store.state.resources.filter(item => item.movieId === resource.movieId && episodeKey(item.episode) === episode);
+    const task = Promise.allSettled(resources.map(item => this.probe(item))).then(results => {
+      const rejected = results.find(result => result.status === 'rejected');
+      if (rejected?.status === 'rejected') throw rejected.reason;
+      return resources;
+    });
+    this.pendingPlaybackChecks.set(key, task);
+    void task.finally(() => { if (this.pendingPlaybackChecks.get(key) === task) this.pendingPlaybackChecks.delete(key); }).catch(() => {});
+    return task;
+  }
+  private resourceOperation(resource: Resource, refresh: boolean, measure: boolean, signal: AbortSignal, onStart?: () => void): Promise<Resource> {
     if (this.stopping) return Promise.reject(new Error('服务正在停止'));
-    const key = `${resource.id}:${refresh}:${signal === this.controller.signal ? 'manual' : 'run'}`;
+    const key = `${resource.id}:${refresh}:${measure}:${signal === this.controller.signal ? 'manual' : 'run'}`;
     const pending = this.pendingProbes.get(key);
     if (pending) return pending;
     const combinedSignal = AbortSignal.any([this.controller.signal, signal]);
@@ -359,12 +329,13 @@ export class Worker {
         rememberResource(resource);
         resource.url = selected.url; resource.resolvedAt = selected.resolvedAt || new Date().toISOString();
         resource.referer = selected.referer || resource.pageUrl;
-        resource.probe = emptyProbe(); rememberResource(resource); await this.store.save();
+        resource.probe = emptyProbe(); resource.updatedAt = nextResourceTimestamp(resource); rememberResource(resource); await this.store.save();
       }
+      if (!measure) return resource;
       const original = resource.url, resolvedAt = resource.resolvedAt;
       const result = await probeResource({ ...resource }, { ...this.store.state.settings }, combinedSignal);
       combinedSignal.throwIfAborted();
-      if (resource.url === original && resource.resolvedAt === resolvedAt) { rememberResource(resource); resource.probe = result; rememberResource(resource); resource.updatedAt = new Date().toISOString(); await this.store.save(); }
+      if (resource.url === original && resource.resolvedAt === resolvedAt) { rememberResource(resource); resource.probe = result; rememberResource(resource); resource.updatedAt = nextResourceTimestamp(resource); await this.store.save(); }
       return resource;
     }, combinedSignal), combinedSignal);
     this.pendingProbes.set(key, task);

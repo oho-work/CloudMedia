@@ -163,7 +163,7 @@ test('API, collector, worker, HLS probing and file persistence work together', {
     assert.equal(valid.status, 200);
   });
 
-  await t.test('a new HTML source can be collected, persisted and probed through the API', async () => {
+  await t.test('a new HTML source collects pending resources and measures them only on playback', async () => {
     const created = await request('/api/sources', 'POST', sourceDefaults({ name: '本地公开测试源', baseUrl: upstreamOrigin, listPath: '/catalog', maxPages: 1, maxItems: 1, maxResourcePages: 1, requestIntervalMs: 0 }));
     assert.equal(created.status, 201); source = created.body;
     assert.equal(source.adapter, 'html'); assert.equal(source.requestIntervalMs, 0);
@@ -174,7 +174,7 @@ test('API, collector, worker, HLS probing and file persistence work together', {
     const list = await request('/api/movies');
     assert.equal(list.body.total, 1); firstMovieId = list.body.items[0].id;
     const detail = await request(`/api/movies/${firstMovieId}`);
-    const movie = detail.body.movie as Movie; const resource = detail.body.resources[0] as Resource;
+    const movie = detail.body.movie as Movie; let resource = detail.body.resources[0] as Resource;
     firstResourceId = resource.id;
     assert.equal(movie.title, '集成测试电影'); assert.equal(movie.year, '2026'); assert.deepEqual(movie.actors, ['甲', '乙']);
     assert.match(movie.poster, /^\/media\/posters\//, 'poster must be served from the preview memory store');
@@ -183,6 +183,12 @@ test('API, collector, worker, HLS probing and file persistence work together', {
     assert.equal(posterResponse.status, 200); assert.match(posterResponse.headers.get('content-type') || '', /^image\/png/);
     assert.equal((await posterResponse.arrayBuffer()).byteLength, movie.posterArchive?.bytes);
     await assert.rejects(readdir(process.env.POSTER_DIR!), { code: 'ENOENT' });
+    assert.equal(resource.probe.status, 'pending');
+    assert.equal(upstreamCalls.filter(item => item.path === '/segment.ts').length, 0);
+    assert.deepEqual(run.progress?.probes, { queued: 0, active: 0, passed: 0, failed: 0 });
+    const checked = await request(`/api/resources/${firstResourceId}/check-playback`, 'POST');
+    assert.equal(checked.status, 200);
+    resource = checked.body.resources[0];
     assert.equal(resource.probe.status, 'ok', resource.probe.error ?? '');
     assert.equal(resource.probe.width, 1920); assert.equal(resource.probe.height, 1080);
     assert.equal(resource.probe.sampledSegments, 1); assert.equal(resource.probe.bytesRead, 16384);
@@ -218,7 +224,9 @@ test('API, collector, worker, HLS probing and file persistence work together', {
     assert.equal(store!.state.movies[0].id, firstMovieId); assert.equal(store!.state.resources[0].id, firstResourceId);
   });
 
-  await t.test('refresh resolves a changed signed URL from its stable public page and probes it without changing resource identity', async () => {
+  await t.test('refresh resolves signed URLs without measurement and a later playback check measures the new address', async () => {
+    const beforeRefresh = await request(`/api/resources/${firstResourceId}/check-playback`, 'POST');
+    assert.equal(beforeRefresh.status, 200);
     const previous = structuredClone(store!.state.resources[0]);
     const previousSampleCount = upstreamCalls.filter(item => item.path === '/segment.ts').length;
     assert.equal(previous.pageUrl, upstreamOrigin + '/voddetail/77');
@@ -228,7 +236,7 @@ test('API, collector, worker, HLS probing and file persistence work together', {
     await expired.text();
     const refreshed = await request(`/api/resources/${firstResourceId}/refresh`, 'POST');
     assert.equal(refreshed.status, 200, refreshed.body.error ?? '');
-    const resource = refreshed.body as Resource;
+    let resource = refreshed.body as Resource;
     assert.equal(resource.id, previous.id); assert.equal(resource.movieId, previous.movieId);
     assert.equal(resource.name, previous.name); assert.equal(resource.episode, previous.episode);
     assert.equal(resource.pageUrl, previous.pageUrl); assert.equal(resource.referer, previous.pageUrl);
@@ -237,16 +245,20 @@ test('API, collector, worker, HLS probing and file persistence work together', {
     assert.ok(resource.resolvedAt && resource.resolvedAt !== previous.resolvedAt);
     assert.ok(new Date(resource.resolvedAt!).getTime() > new Date(previous.resolvedAt!).getTime());
     refreshedResolvedAt = resource.resolvedAt!;
-    assert.equal(resource.probe.status, 'ok', resource.probe.error ?? '');
-    assert.equal(resource.probe.width, 1920); assert.equal(resource.probe.sampledSegments, 1);
+    assert.equal(resource.probe.status, 'pending'); assert.equal(resource.probe.checkedAt, null);
     assert.ok(resource.urlHistory?.some(entry => entry.url === previous.url));
     assert.ok(resource.probeHistory?.some(entry => entry.checkedAt === previous.probe.checkedAt));
+    assert.equal(upstreamCalls.filter(item => item.path === '/segment.ts').length, previousSampleCount);
+    const persisted = JSON.parse(await readFile(snapshotPath, 'utf8'));
+    assert.equal(persisted.resources[0].url, resource.url); assert.equal(persisted.resources[0].resolvedAt, refreshedResolvedAt);
+    assert.equal(persisted.resources[0].probe.status, 'pending');
+    const checked = await request(`/api/resources/${firstResourceId}/check-playback`, 'POST');
+    assert.equal(checked.status, 200); resource = checked.body.resources[0];
+    assert.equal(resource.probe.status, 'ok', resource.probe.error ?? '');
+    assert.equal(resource.probe.width, 1920); assert.equal(resource.probe.sampledSegments, 1);
     assert.ok(resource.probe.checkedAt! > previous.probe.checkedAt!);
     assert.equal(upstreamCalls.filter(item => item.path === '/segment.ts').length, previousSampleCount + 1);
     assert.ok(upstreamCalls.some(item => item.path === '/segment.ts' && item.query === '?token=renewed-signature'));
-    const persisted = JSON.parse(await readFile(snapshotPath, 'utf8'));
-    assert.equal(persisted.resources[0].url, resource.url); assert.equal(persisted.resources[0].resolvedAt, refreshedResolvedAt);
-    assert.equal(persisted.resources[0].probe.status, 'ok');
   });
 
   await t.test('changing the source domain updates catalog references and retains the independent media URL', async () => {

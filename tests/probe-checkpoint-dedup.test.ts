@@ -35,7 +35,7 @@ test('repeated checkpoints with multiple URLs for one logical episode preserve i
   assert.deepEqual(resource.probe, measurement, 'an unchanged final address must not become pending during a cumulative checkpoint');
 });
 
-test('a completed incremental probe survives later episode checkpoints with multiple player URLs', { timeout: 5000 }, async t => {
+test('an explicit playback check survives later collection checkpoints without automatic media requests', { timeout: 5000 }, async t => {
   const previousPrivate = process.env.ALLOW_PRIVATE_UPSTREAM;
   process.env.ALLOW_PRIVATE_UPSTREAM = 'true';
   let origin = '';
@@ -68,16 +68,21 @@ test('a completed incremental probe survives later episode checkpoints with mult
     }
   });
   const run = worker.enqueue(state.sources[0]);
-  await waitFor(() => Boolean(secondPage) && state.resources.some(resource => resource.episode === '第2集' && resource.probe.status === 'ok'), 'first episode must finish probing while the next playback page is still gated');
+  await waitFor(() => Boolean(secondPage) && state.resources.some(resource => resource.episode === '第2集'), 'the first address must persist while the next playback page is gated');
   assert.equal(state.resources.length, 1);
+  assert.equal(durable.resources[0].probe.status, 'pending');
+  assert.equal(requests.filter(request => request.endsWith('.m3u8')).length, 0, 'collection must not fetch media playlists');
+  await worker.checkPlayback(state.resources[0]);
   assert.equal(durable.resources[0].probe.status, 'ok');
   secondPage!.end(`<video src="${origin}/z.m3u8"></video>`);
   await waitFor(() => !['running', 'queued'].includes(run.status), 'movie pipeline must finish');
   assert.equal(run.status, 'success', run.message);
   assert.equal(state.resources.length, 2);
   assert.equal(state.resources.find(resource => resource.episode === '第2集')?.url, origin + '/b.m3u8');
-  assert.ok(state.resources.every(resource => resource.probe.status === 'ok'));
-  assert.ok(durable.resources.every(resource => resource.probe.status === 'ok'));
+  assert.equal(state.resources.find(resource => resource.episode === '第2集')?.probe.status, 'ok');
+  assert.equal(durable.resources.find(resource => resource.episode === '第2集')?.probe.status, 'ok');
+  assert.equal(durable.resources.find(resource => resource.episode === '第1集')?.probe.status, 'pending');
+  assert.equal(requests.filter(request => request === '/z.m3u8').length, 0);
   assert.equal(requests.filter(request => request === '/b.m3u8').length, 1, 'later checkpoints must keep the existing measurement instead of reprobing unchanged URLs');
   assert.equal(requests.filter(request => request === '/a.m3u8').length, 0, 'superseded duplicate URLs must not start redundant probes');
 });

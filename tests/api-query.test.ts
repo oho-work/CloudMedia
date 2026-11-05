@@ -34,6 +34,6 @@ test('catalogue pagination rejects non-integer and non-finite queries without lo
   const second = await fetch(base + '?page=2&limit=2').then(response => response.json());
   assert.equal(first.items.length, 2); assert.equal(second.items.length, 1);
   assert.equal(new Set([...first.items, ...second.items].map(item => item.id)).size, 3);
-  assert.equal((await fetch(base).then(response => response.json())).limit, 24);
+  assert.equal((await fetch(base).then(response => response.json())).limit, 12);
   assert.equal((await fetch(base + '?limit=500').then(response => response.json())).limit, 100);
 });

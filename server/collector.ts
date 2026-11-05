@@ -55,7 +55,7 @@ class SourceClient {
   private requests: TaskLimiter;
   readonly limit: number;
   constructor(private source: Source, private context: CollectionContext, private abort: (reason: unknown) => void = () => {}) {
-    this.limit = Math.max(1, Math.min(20, Math.floor(source.concurrency || 1)));
+    this.limit = Math.max(1, Math.min(100, Math.floor(source.concurrency || 1)));
     this.requests = new TaskLimiter(this.limit);
   }
   private headers(referer: string) {
@@ -135,6 +135,7 @@ export async function resolvePosterPage(source: Source, pageUrl: string, context
 /** Only explicit format/category names identify a series. 剧情 and 喜剧 are genres. */
 function categoryType(value: string): string | undefined {
   const name = value.replace(/[\s/|>›»：:]+/g, '');
+  if (/^(?:短剧|微短剧|网络短剧)$/.test(name)) return '短剧';
   if (/^(?:动漫|动画|动画片|动画剧集|动漫剧集|国产动漫|中国动漫|日本动漫|日韩动漫|欧美动漫|港台动漫|海外动漫|韩国动漫)$/.test(name)) return '动漫';
   if (/^(?:电视剧|连续剧|剧集|电视连续剧|国产剧|大陆剧|内地剧|日韩剧|韩剧|韩国剧|日剧|日本剧|欧美剧|美剧|英剧|港剧|台剧|香港剧|台湾剧|港台剧|泰剧|泰国剧|海外剧|短剧|网络剧|网剧)$/.test(name)) return '电视剧';
   if (/^(?:综艺|大陆综艺|内地综艺|日韩综艺|欧美综艺|港台综艺|海外综艺|综艺节目|综艺纪录)$/.test(name)) return '综艺';
@@ -176,7 +177,7 @@ export function parseHtmlMovie(html: string, source: Source, pageUrl: string, ti
     for (const id of detailIds) if (namesById.has(id)) { type = namesById.get(id); break; }
   }
   const genreTypes = (genres.length ? genres : list(label('类型'))).map(categoryType).filter(Boolean);
-  type ||= genreTypes.includes('动漫') ? '动漫' : genreTypes.includes('电视剧') ? '电视剧' : genreTypes.includes('综艺') ? '综艺' : genreTypes.includes('电影') ? '电影' : label('类型') || '电影';
+  type ||= genreTypes.includes('短剧') ? '短剧' : genreTypes.includes('动漫') ? '动漫' : genreTypes.includes('电视剧') ? '电视剧' : genreTypes.includes('综艺') ? '综艺' : genreTypes.includes('电影') ? '电影' : label('类型') || '电影';
   const image = $(source.posterSelector || 'img').first();
   const poster = image.attr('data-original') || image.attr('data-src') || image.attr('src') || $('meta[property="og:image"]').attr('content') || '';
   return { externalId: new URL(pageUrl).pathname, pageUrl, title,
@@ -501,7 +502,7 @@ async function* collectSourcePages(source: Source, context: CollectionContext, a
         schedule(detailUrl, response.url);
       }
       // Preserve ordered date early-stop before fetching the next listing,
-      // without waiting for accepted movies to finish their resource/probe work.
+      // without waiting for accepted movies to finish resolving their resources.
       if (dateRange) await decisions;
       if (reachedStart) { context.log('已到达开始日期之前的记录，停止翻页'); break; }
       const nextHref = source.nextPageSelector ? $(source.nextPageSelector).first().attr('href') : undefined;

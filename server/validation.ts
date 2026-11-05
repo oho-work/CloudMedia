@@ -14,7 +14,7 @@ export const sourceSchema = z.object({
   listPath: z.string().max(2048), detailLinkSelector: z.string().max(1000), titleSelector: z.string().max(1000),
   posterSelector: z.string().max(1000), descriptionSelector: z.string().max(1000), resourceSelector: z.string().max(1000), nextPageSelector: z.string().max(1000),
   requestIntervalMs: z.number().int().min(0).max(60000),
-  concurrency: z.number().int().min(1).max(20).default(1),
+  concurrency: z.number().int().min(1).max(100).default(1),
   // Load older saved configurations while ignoring controls that no longer exist.
   maxPages: z.unknown().transform(() => 0), maxItems: z.unknown().transform(() => 0), maxResourcePages: z.unknown().transform(() => 0),
   respectRobots: z.unknown().transform(() => false), referer: z.unknown().transform(() => ''),
@@ -33,7 +33,7 @@ export const settingsSchema = z.object({
   dailyTime: z.string().length(5, '运行时间须为 HH:mm').regex(DAILY_TIME_PATTERN, '运行时间须为 HH:mm').optional(),
   dailyTimes: z.array(z.string().length(5, '运行时间须为 HH:mm').regex(DAILY_TIME_PATTERN, '运行时间须为 HH:mm')).min(1, '请至少保留一个每日运行时间').max(MAX_DAILY_TIMES, '每日运行时间最多 24 条').optional(),
   timezone: z.string().max(100).optional(),
-  schedulerEnabled: z.boolean(), probeEnabled: z.boolean(), sampleSegments: z.number().int().min(1).max(10),
+  schedulerEnabled: z.boolean(), probeEnabled: z.boolean().transform(() => false), sampleSegments: z.number().int().min(1).max(10),
   sampleBytes: z.number().int().min(16384).max(4194304), probeTimeoutMs: z.number().int().min(1000).max(60000),
   preferredQuality: z.enum(['highest', 'lowest']), maxRetries: z.number().int().min(0).max(4),
   resourceRefreshHours: z.number().int().min(1).max(720),

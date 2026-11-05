@@ -81,6 +81,11 @@ async function fixture(t: TestContext, concurrency = 2, movieCount = 1, episodes
     for (const [response, body] of detailResponses) response.end(body);
     detailResponses.clear();
   };
+  const releaseOneDetail = () => {
+    const first = detailResponses.entries().next().value;
+    assert.ok(first, 'a detail request must be held');
+    detailResponses.delete(first[0]); first[0].end(first[1]);
+  };
   const releaseRefresh = () => {
     holdRefresh = false;
     for (const response of refreshResponses) response.end(`<script>var player_aaaa={"url":"${origin}/media/rotated.m3u8"}</script>`);
@@ -99,7 +104,7 @@ async function fixture(t: TestContext, concurrency = 2, movieCount = 1, episodes
       name: 'line', episode: String(index + 1), url: `${origin}/media/${externalId}-${index + 1}.m3u8`, pageUrl: origin + '/vodplay/manual', resolvedAt: '2026-01-01T00:00:00Z',
     })),
   }).resources;
-  return { state, worker, starts, requestStarts, snapshots, resources, release, releaseWave, releaseDetails, releaseRefresh, hold: () => { held = true; }, holdDetails: () => { holdDetails = true; }, holdRefresh: () => { holdRefresh = true; }, refreshStarts: () => refreshStarts, durable: () => durable, peak: () => peak, requestPeak: () => requestPeak, saveHook: (hook: () => Promise<void>) => { beforeSave = hook; } };
+  return { state, worker, starts, requestStarts, snapshots, resources, release, releaseWave, releaseDetails, releaseOneDetail, releaseRefresh, hold: () => { held = true; }, holdDetails: () => { holdDetails = true; }, holdRefresh: () => { holdRefresh = true; }, refreshStarts: () => refreshStarts, durable: () => durable, peak: () => peak, requestPeak: () => requestPeak, saveHook: (hook: () => Promise<void>) => { beforeSave = hook; } };
 }
 
 test('collector details and manual probes share one source request budget', async t => {
@@ -164,34 +169,49 @@ test('manual probes use the source concurrency and do not block another source',
   assert.equal(f.state.resources.filter(resource => resource.probe.status === 'ok').length, 5);
 });
 
-test('collection processes independent movies and probes after saving metadata', async t => {
-  const f = await fixture(t, 2, 2, 2);
-  const run = f.worker.enqueue(f.state.sources[0]);
-  await waitFor(() => f.starts.length === 2, 'collection should begin two probes concurrently');
-  assert.equal(f.durable().movies.length, 2);
-  assert.equal(f.durable().resources.length, 4);
-  assert.ok(f.durable().resources.every(resource => resource.probe.status === 'pending'));
-  f.state.sources[0].concurrency = 1;
-  const [manual] = f.resources(1, 'during-run');
-  const manualSettled = Promise.allSettled([f.worker.probe(manual)]);
-  await delay(30);
-  assert.equal(f.starts.length, 2, 'manual probes share the running source limit');
-  f.releaseWave();
-  await waitFor(() => f.starts.length === 4, 'the frozen limit should start two more probes after an edit');
-  assert.equal(f.peak(), 2);
+test('playback measurements fill 100 source slots and clamp larger legacy source settings', async t => {
+  const f = await fixture(t, 150);
+  const resources = f.resources(105);
+  for (const resource of resources) resource.episode = '第1集';
+  const checking = f.worker.checkPlayback(resources[0]);
+  await waitFor(() => f.starts.length === 100, 'all one hundred permitted lines should start');
+  await delay(25);
+  assert.equal(f.starts.length, 100, 'remaining lines must wait for a source slot');
+  assert.equal(f.peak(), 100);
   f.release();
-  await manualSettled;
-  await waitFor(() => Boolean(f.durable().runs.find(item => item.id === run.id && item.status === 'success')), 'collection should finish durably');
-  assert.equal(f.peak(), 2, 'the run retains its configured source concurrency');
+  assert.equal((await checking).length, 105);
+  assert.ok(resources.every(resource => resource.probe.status === 'ok'));
+});
+
+test('source edits keep the active collection budget frozen and apply after collection finishes', async t => {
+  const f = await fixture(t, 2, 2, 2);
+  f.holdDetails();
+  const run = f.worker.enqueue(f.state.sources[0]);
+  await waitFor(() => f.requestStarts.filter(path => path.startsWith('/voddetail/')).length === 2, 'two collection details should occupy the source');
+  f.state.sources[0].concurrency = 1;
+  const manual = f.resources(4, 'during-run');
+  const manualSettled = Promise.allSettled(manual.map(resource => f.worker.probe(resource)));
+  await delay(30);
+  assert.equal(f.starts.length, 0, 'manual probes wait for the running collection');
+  f.releaseDetails();
+  await waitFor(() => f.starts.length === 2, 'the frozen source budget should admit two queued probes');
+  assert.equal(f.peak(), 2);
+  await waitFor(() => Boolean(f.durable().runs.find(item => item.id === run.id && item.status === 'success')), 'collection finishes without waiting for manual measurements');
+  f.releaseWave();
+  await waitFor(() => f.starts.length === 3, 'after collection the edited limit admits only one replacement');
+  await delay(30);
+  assert.equal(f.starts.length, 3);
+  f.release(); await manualSettled;
   assert.equal(run.scanned, 2);
   assert.equal(run.added, 2);
   assert.equal(run.resourceCount, 4);
-  assert.ok(f.durable().resources.every(resource => resource.probe.status === 'ok'));
+  assert.ok(f.durable().resources.filter(resource => !manual.some(item => item.id === resource.id)).every(resource => resource.probe.status === 'pending'));
+  assert.deepEqual(run.progress?.probes, { queued: 0, active: 0, passed: 0, failed: 0 });
   f.hold();
   const afterRun = Promise.allSettled(f.resources(2, 'after-run').map(resource => f.worker.probe(resource)));
-  await waitFor(() => f.starts.length === 6, 'the edited limit applies to the next manual operation');
+  await waitFor(() => f.starts.length === 5, 'the edited limit applies to the next manual operation');
   await delay(30);
-  assert.equal(f.starts.length, 6, 'source concurrency returns to its edited setting after the run');
+  assert.equal(f.starts.length, 5, 'source concurrency returns to its edited setting after the run');
   f.release(); await afterRun;
 });
 
@@ -260,27 +280,32 @@ test('an in-flight manual refresh cannot replace a newer collected resource iden
   assert.equal(f.starts.length, 0, 'obsolete refresh results do not start a probe');
 });
 
-test('cancelled collection drains active probes and retains saved resources without probe results', async t => {
+test('cancelled collection drains detail requests and retains saved resources without measurements', async t => {
   const f = await fixture(t, 2, 2, 2);
+  f.holdDetails();
   const run = f.worker.enqueue(f.state.sources[0]);
-  await waitFor(() => f.starts.length === 2, 'two episode probes should start');
+  await waitFor(() => f.requestStarts.filter(path => path.startsWith('/voddetail/')).length === 2, 'two detail requests should start');
+  f.releaseOneDetail();
+  await waitFor(() => f.durable().resources.length === 2, 'a completed movie should retain its addresses before cancellation');
   await f.worker.cancel(run.id);
   await waitFor(() => Boolean(f.durable().runs.find(item => item.id === run.id && item.finishedAt)), 'cancelled run must become durable only after tasks drain');
   assert.equal(run.status, 'interrupted');
-  assert.equal(f.starts.length, 2, 'queued episode probes never start after cancellation');
-  assert.equal(f.durable().resources.length, 4);
+  assert.equal(f.starts.length, 0, 'collection never starts episode probes');
+  assert.equal(f.durable().resources.length, 2);
   assert.ok(f.durable().resources.every(resource => resource.probe.status === 'pending'));
   const progress = f.durable().runs.find(item => item.id === run.id)?.progress;
   assert.equal(progress?.activeMovies, 0);
-  assert.equal(progress?.completedMovies, 0, 'cancelled measurements must not mark a movie completed');
+  assert.equal(progress?.completedMovies, 1, 'the fully collected movie remains completed');
   assert.deepEqual(progress?.activeMovieTitles, []);
   assert.deepEqual(progress?.probes, { queued: 0, active: 0, passed: 0, failed: 0 });
   assert.equal(progress?.failures.total, 0, 'user cancellation is not a failed request');
   f.release();
 });
 
-test('a parallel probe save failure records an error, drains its peers, and permits a retry', async t => {
-  const f = await fixture(t, 2, 2, 2);
+test('a playback batch reports a failed save after draining peer results and permits a fresh check', async t => {
+  const f = await fixture(t, 2);
+  const resources = f.resources(4);
+  for (const resource of resources) resource.episode = '第1集';
   let failed = false;
   f.saveHook(async () => {
     if (!failed && f.state.resources.some(resource => resource.probe.status === 'ok')) {
@@ -288,18 +313,17 @@ test('a parallel probe save failure records an error, drains its peers, and perm
       throw new Error('parallel probe storage unavailable');
     }
   });
-  const run = f.worker.enqueue(f.state.sources[0]);
+  const checking = f.worker.checkPlayback(resources[0]);
+  const rejected = assert.rejects(checking, /parallel probe storage unavailable/);
   await waitFor(() => f.starts.length === 2, 'parallel probes should hold the first batch');
-  f.releaseWave();
-  await waitFor(() => Boolean(f.durable().runs.find(item => item.id === run.id && item.finishedAt)), 'failed batch should drain and persist its error');
-  assert.equal(run.status, 'error', 'internal error cancellation is not a user interruption');
-  assert.match(run.message, /parallel probe storage unavailable/);
-  assert.equal(f.starts.length, 2, 'failed batches never start their queued probes');
-  assert.equal(f.durable().movies.length, 2);
-  assert.equal(f.durable().resources.length, 4);
   f.release();
-  const retry = f.worker.enqueue(f.state.sources[0]);
-  await waitFor(() => Boolean(f.durable().runs.find(item => item.id === retry.id && item.status === 'success')), 'retry should finish after storage recovers');
+  await rejected;
+  assert.ok(failed);
+  assert.equal(f.starts.length, 4, 'one rejected result must not discard queued peer lines');
+  assert.equal(f.durable().movies.length, 1);
+  assert.equal(f.durable().resources.length, 4);
+  await f.worker.checkPlayback(resources[1]);
+  assert.equal(f.starts.length, 8, 'a completed check must release its pending entry for the next playback');
   assert.ok(f.durable().resources.every(resource => resource.probe.status === 'ok'));
 });
 

@@ -8,7 +8,7 @@ export const defaultChromeUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)
 const legacyDefaultUserAgent = 'CloudMedia/0.1 (+local media catalog; public pages only)';
 export const defaultSettings: Settings = {
   dailyTime: DEFAULT_DAILY_TIME, dailyTimes: [DEFAULT_DAILY_TIME], timezone: BEIJING_TIMEZONE, schedulerEnabled: true,
-  probeEnabled: true, sampleSegments: 1, sampleBytes: 262144,
+  probeEnabled: false, sampleSegments: 1, sampleBytes: 262144,
   probeTimeoutMs: 15000, preferredQuality: 'highest', maxRetries: 2,
   resourceRefreshHours: 168,
   userAgent: defaultChromeUserAgent,
@@ -18,7 +18,7 @@ export function settingsDefaults(input: Partial<Settings> = {}): Settings {
   const userAgent = !input.userAgent?.trim() || input.userAgent.trim() === legacyDefaultUserAgent
     ? defaultChromeUserAgent : input.userAgent;
   const dailyTimes = normalizedDailyTimes(input);
-  return { ...defaultSettings, ...input, userAgent, dailyTimes, dailyTime: dailyTimes[0], timezone: BEIJING_TIMEZONE };
+  return { ...defaultSettings, ...input, probeEnabled: false, userAgent, dailyTimes, dailyTime: dailyTimes[0], timezone: BEIJING_TIMEZONE };
 }
 export const emptyProbe = (): ProbeResult => ({ status: 'pending', checkedAt: null,
   width: null, height: null, bandwidth: null, speedMbps: null, latencyMs: null,

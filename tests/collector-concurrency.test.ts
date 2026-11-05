@@ -40,6 +40,29 @@ async function collect(source: Parameters<typeof collectSource>[0], options = co
 const detailLinks = (count: number) => Array.from({ length: count }, (_, index) => `<a href="/voddetail/${index + 1}">movie</a>`).join('');
 const episodeLinks = (id: string, count: number) => Array.from({ length: count }, (_, index) => `<a href="/vodplay/${id}-${index + 1}">第${index + 1}集</a>`).join('');
 
+test('collector fills 100 source slots and clamps legacy larger concurrency values', { timeout: 10000 }, async () => {
+  const held: ServerResponse[] = [];
+  let holding = true;
+  const f = await fixture((path, _request, response) => {
+    if (path === '/list') return void response.end(detailLinks(105));
+    if (holding) held.push(response); else response.end(`<h1>${path}</h1>`);
+  });
+  const collection = collect(f.source(150));
+  try {
+    const deadline = Date.now() + 3000;
+    while (held.length < 100 && Date.now() < deadline) await delay(5);
+    assert.equal(held.length, 100, 'one hundred independent movies must start without the former twenty-slot cap');
+    await delay(25);
+    assert.equal(f.maximum, 100, 'legacy larger values must never exceed the runtime cap');
+    holding = false;
+    held.forEach((response, index) => response.end(`<h1>Movie ${index}</h1>`));
+    assert.equal((await collection).length, 105);
+  } finally {
+    holding = false; held.forEach(response => response.end('<h1>Released</h1>'));
+    await collection.catch(() => {}); await f.close();
+  }
+});
+
 test('collectors share the injected source request budget across listing, details and playback', { timeout: 5000 }, async () => {
   const f = await fixture((path, _request, response) => {
     if (path === '/list') return void response.end(detailLinks(2));
