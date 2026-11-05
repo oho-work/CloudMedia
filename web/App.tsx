@@ -2,7 +2,7 @@ import { useCallback, useEffect, useId, useRef, useState, type FormEvent, type R
 import type Hls from 'hls.js';
 import { RunCards } from './components/RunCards';
 import { ScheduleTimePicker, SegmentCountControl } from './components/SettingsControls';
-import { Activity, ArrowDownToLine, ArrowRight, Check, ChevronDown, ChevronLeft, ChevronRight, CircleAlert, Clock3, Clapperboard, Database, ExternalLink, Film, Globe2, Layers3, ListVideo, LoaderCircle, LockKeyhole, Pencil, Play, Plus, Radio, RefreshCw, Search, Settings2, ShieldCheck, SlidersHorizontal, Trash2, Wifi, X } from 'lucide-react';
+import { Activity, ArrowDownToLine, ArrowRight, Check, ChevronDown, ChevronLeft, ChevronRight, CircleAlert, Clock3, Clapperboard, Database, ExternalLink, Film, Globe2, Layers3, LayoutDashboard, ListVideo, LoaderCircle, LockKeyhole, Pencil, Play, Plus, Radio, RefreshCw, Search, Settings2, ShieldCheck, SlidersHorizontal, Sparkles, Trash2, Tv, Wifi, X } from 'lucide-react';
 import type { CollectionRequest, Dashboard, Movie, Resource, Run, Settings, Source } from '../shared/types';
 import { localPosterPath } from '../shared/poster-path';
 import { bytesToMegabytes, megabytesToBytes, millisecondsToSeconds, secondsToMilliseconds } from '../shared/settings-units';
@@ -11,7 +11,7 @@ import { episodeKey } from '../shared/episode';
 import { PlaybackCheckClient } from './playback-check';
 import './components/PlaybackResources.css';
 
-type Page = 'library' | 'sources' | 'runs' | 'settings';
+type Page = 'overview' | 'library' | 'movies' | 'series' | 'anime' | 'shorts' | 'variety' | 'sources' | 'runs' | 'settings';
 type MovieList = {
   items: (Movie & { resourceCount: number; libraryType: string; updateStatus: 'ongoing' | 'completed' | 'unknown' })[];
   total: number; page: number; limit: number; types: string[]; years: string[]; genres: string[]; regions: string[];
@@ -74,7 +74,7 @@ function Toggle({ checked, onChange, label }: { checked: boolean; onChange: (val
 }
 
 export default function App() {
-  const [page, setPage] = useState<Page>('library');
+  const [page, setPage] = useState<Page>('overview');
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
   const [sources, setSources] = useState<Source[]>([]);
   const [error, setError] = useState('');
@@ -111,17 +111,25 @@ export default function App() {
     finally { setAuthBusy(false); }
   };
   const nav = [
-    { key: 'library', name: '影视库', icon: Film }, { key: 'sources', name: '采集源', icon: Globe2 },
+    { key: 'overview', name: '概览', icon: LayoutDashboard }, { key: 'library', name: '影视库', icon: Layers3 },
+    { key: 'movies', name: '电影', icon: Film }, { key: 'series', name: '电视剧', icon: Tv },
+    { key: 'anime', name: '动漫', icon: Sparkles }, { key: 'shorts', name: '短剧', icon: Clapperboard },
+    { key: 'variety', name: '综艺', icon: Radio }, { key: 'sources', name: '采集源', icon: Globe2 },
     { key: 'runs', name: '任务记录', icon: Activity }, { key: 'settings', name: '系统设置', icon: Settings2 },
   ] as const;
+  const libraryType = ({ library: '', movies: '电影', series: '电视剧', anime: '动漫', shorts: '短剧', variety: '综艺' } as Partial<Record<Page, string>>)[page];
+  const pageTitle = nav.find(item => item.key === page)?.name ?? '概览';
+  const navigation = useRef<HTMLElement>(null);
+  useEffect(() => { navigation.current?.querySelector<HTMLElement>('[aria-current="page"]')?.scrollIntoView({ block: 'nearest', inline: 'nearest' }); }, [page]);
   return <div className="app-shell">
-    <aside className="sidebar"><button className="brand" onClick={() => navigate('library')} aria-label="CloudMedia 首页"><span className="brand-icon"><Clapperboard size={22} /></span><span>Cloud<span className="brand-light">Media</span><small>YOUR PERSONAL CINEMA</small></span></button>
-      <div className="nav-caption">工作空间</div><nav aria-label="主导航">{nav.map(item => <button key={item.key} className={`nav-item ${page === item.key ? 'selected' : ''}`} aria-current={page === item.key ? 'page' : undefined} onClick={() => navigate(item.key)}><item.icon size={19} /><span>{item.name}</span>{item.key === 'runs' && !!dashboard?.runningCount && <span className="nav-count">{dashboard.runningCount}</span>}{page === item.key && <i />}</button>)}</nav>
+    <aside className="sidebar"><button className="brand" onClick={() => navigate('overview')} aria-label="CloudMedia 首页"><span className="brand-icon"><Clapperboard size={22} /></span><span>Cloud<span className="brand-light">Media</span><small>YOUR PERSONAL CINEMA</small></span></button>
+      <div className="nav-caption">工作空间</div><nav ref={navigation} aria-label="主导航">{nav.map(item => <button key={item.key} className={`nav-item ${page === item.key ? 'selected' : ''}`} aria-current={page === item.key ? 'page' : undefined} onClick={() => navigate(item.key)}><item.icon size={19} /><span>{item.name}</span>{item.key === 'runs' && !!dashboard?.runningCount && <span className="nav-count">{dashboard.runningCount}</span>}{page === item.key && <i />}</button>)}</nav>
       <div className="sidebar-bottom"><div className="local-badge"><span className={`status-dot ${dashboard ? 'online' : ''}`} />{dashboard ? '本地服务已连接' : '正在连接本地服务'}</div><div className="storage-note"><Database size={13} /> {dashboard?.storage === 'postgres' ? 'PostgreSQL · 本地资料库' : dashboard ? '本地文件 · 预览模式' : 'CloudMedia 0.1'}</div><div className="sidebar-footer">留住好电影，随时再相遇。<span>LOCAL COLLECTION / V0.1</span></div></div>
     </aside>
-    <main className="main-content"><header className="topbar"><div className="breadcrumb">我的空间 <ChevronRight size={13} /> <span>{nav.find(item => item.key === page)?.name}</span></div><div className="topbar-right"><span className="local-label"><ShieldCheck size={14} /> 本地管理</span><button className="avatar" aria-label="打开系统设置" onClick={() => navigate('settings')}>CM</button></div></header>
+    <main className="main-content"><header className="topbar"><div className="breadcrumb">我的空间 <ChevronRight size={13} /> <span>{pageTitle}</span></div><div className="topbar-right"><span className="local-label"><ShieldCheck size={14} /> 本地管理</span><button className="avatar" aria-label="打开系统设置" onClick={() => navigate('settings')}>CM</button></div></header>
       <div className="page-content">{error && <div className="error-banner" role="alert"><CircleAlert size={18} /><span>{error}</span><IconButton label="关闭错误" onClick={() => setError('')}><X size={15} /></IconButton></div>}
-        {page === 'library' && <Library dashboard={dashboard} sources={sources} revision={revision} onMovie={setSelectedMovie} onSource={() => setSourceEdit('new')} onNavigateSources={() => navigate('sources')} />}
+        {page === 'overview' && <Overview dashboard={dashboard} onBrowse={() => navigate('library')} onSources={() => navigate('sources')} onRuns={() => navigate('runs')} />}
+        {libraryType !== undefined && <Library key={page} category={libraryType} title={pageTitle} dashboard={dashboard} sources={sources} revision={revision} onMovie={setSelectedMovie} onNavigateSources={() => navigate('sources')} />}
         {page === 'sources' && <Sources sources={sources} dashboard={dashboard} onEdit={setSourceEdit} onRun={runSource} onChanged={reload} notify={notify} onError={setError} />}
         {page === 'runs' && <Runs revision={revision} />}
         {page === 'settings' && <SettingsPage dashboard={dashboard} onSaved={() => { reload(); notify('系统设置已保存'); }} />}
@@ -135,9 +143,23 @@ export default function App() {
   </div>;
 }
 
-function Library({ dashboard, sources, revision, onMovie, onSource, onNavigateSources }: { dashboard: Dashboard | null; sources: Source[]; revision: number; onMovie: (id: string) => void; onSource: () => void; onNavigateSources: () => void }) {
+function Overview({ dashboard, onBrowse, onSources, onRuns }: { dashboard: Dashboard | null; onBrowse: () => void; onSources: () => void; onRuns: () => void }) {
+  const stats = [
+    { label: '已归档影片', value: dashboard?.movieCount, unit: '部', icon: Film, color: 'purple', note: '本地保存的影片资料' },
+    { label: '播放资源', value: dashboard?.resourceCount, unit: '条', icon: Layers3, color: 'blue', note: `播放时检测记录：${dashboard?.healthyResources ?? 0} 条通过` },
+    { label: '采集源', value: dashboard?.sourceCount, unit: '个', icon: Globe2, color: 'green', note: `${dashboard?.enabledSourceCount ?? 0} 个源已启用` },
+    { label: '平均下载速度', value: dashboard?.averageSpeedMbps != null ? dashboard.averageSpeedMbps.toFixed(1) : '—', unit: 'Mbps', icon: Wifi, color: 'orange', note: '基于播放时的视频分片检测记录' },
+  ];
+  return <>
+    <section className="library-intro"><div><div className="eyebrow"><span /> COLLECTION OVERVIEW</div><h1>资料库概览</h1><p>查看归档统计与采集状态，从左侧分类开始浏览。</p></div><button className="button primary" onClick={onBrowse}><Film size={17} />浏览影视库</button></section>
+    <section className="stats-grid" aria-label="资料库统计">{stats.map(item => <div className="stat-card" key={item.label}><div className="stat-top"><span>{item.label}</span><span className={`stat-icon ${item.color}`}><item.icon size={17} /></span></div><div className="stat-value">{item.value ?? '—'}<small>{item.unit}</small></div><div className="stat-note">{item.note}</div></div>)}</section>
+    <section className="panel settings-section"><div className="settings-section-heading"><span className="section-icon"><Activity size={20} /></span><div><h2>采集状态</h2><p>{dashboard ? `当前 ${dashboard.runningCount} 个任务进行中。` : '正在读取任务状态…'}</p></div></div><div className="overview-actions"><button className="button secondary" onClick={onRuns}><Activity size={15} />查看任务记录</button><button className="button secondary" onClick={onSources}><Globe2 size={15} />管理采集源</button></div><div className="library-bottom-note"><span><Clock3 size={14} />下次定时采集：{dashboard?.schedulerNextAt ? date(dashboard.schedulerNextAt) : '未安排'}</span></div></section>
+  </>;
+}
+
+function Library({ category, title, dashboard, sources, revision, onMovie, onNavigateSources }: { category: string; title: string; dashboard: Dashboard | null; sources: Source[]; revision: number; onMovie: (id: string) => void; onNavigateSources: () => void }) {
   const [search, setSearch] = useState(''); const [debouncedSearch, setDebouncedSearch] = useState('');
-  const [filters, setFilters] = useState({ type: '', genre: '', region: '', year: '', updateStatus: '', hasResources: '', sourceId: '' });
+  const [filters, setFilters] = useState({ genre: '', region: '', year: '', updateStatus: '', hasResources: '', sourceId: '' });
   const [page, setPage] = useState(1); const [list, setList] = useState<MovieList | null>(null); const [loading, setLoading] = useState(true); const [error, setError] = useState('');
   useEffect(() => {
     if (search === debouncedSearch) return;
@@ -146,18 +168,16 @@ function Library({ dashboard, sources, revision, onMovie, onSource, onNavigateSo
   }, [search, debouncedSearch]);
   useEffect(() => {
     let active = true; const controller = new AbortController(); setLoading(true);
-    const query = new URLSearchParams({ search: debouncedSearch, ...filters, page: String(page), limit: '12' });
+    const query = new URLSearchParams({ search: debouncedSearch, ...filters, type: category, page: String(page), limit: '12' });
     api<MovieList>(`/movies?${query}`, { signal: controller.signal }).then(result => {
       if (active) { setList(result); setPage(result.page); setError(''); }
     }).catch(e => { if (active) setError(e.message); }).finally(() => { if (active) setLoading(false); });
     return () => { active = false; controller.abort(); };
-  }, [debouncedSearch, filters, page, revision, dashboard?.movieCount, dashboard?.resourceCount, dashboard?.runningCount]);
+  }, [category, debouncedSearch, filters, page, revision, dashboard?.movieCount, dashboard?.resourceCount, dashboard?.runningCount]);
   const changeFilter = (key: keyof typeof filters, value: string) => { setFilters(previous => ({ ...previous, [key]: value })); setPage(1); };
-  const clearFilters = () => { setSearch(''); setDebouncedSearch(''); setFilters({ type: '', genre: '', region: '', year: '', updateStatus: '', hasResources: '', sourceId: '' }); setPage(1); };
-  const types = [...new Set(['电影', '电视剧', '动漫', '短剧', '综艺', ...(list?.types ?? [])])];
+  const clearFilters = () => { setSearch(''); setDebouncedSearch(''); setFilters({ genre: '', region: '', year: '', updateStatus: '', hasResources: '', sourceId: '' }); setPage(1); };
   const statusLabels = { ongoing: '连载中', completed: '已完结', unknown: '未标明' };
   const filterFields = [
-    { key: 'type', label: '类型', all: '全部类型', options: types.map(value => ({ value, label: value })) },
     { key: 'genre', label: '题材', all: '全部题材', options: (list?.genres ?? []).map(value => ({ value, label: value })) },
     { key: 'region', label: '地区', all: '全部地区', options: (list?.regions ?? []).map(value => ({ value, label: value })) },
     { key: 'year', label: '年份', all: '全部年份', options: (list?.years ?? []).map(value => ({ value, label: value })) },
@@ -165,34 +185,25 @@ function Library({ dashboard, sources, revision, onMovie, onSource, onNavigateSo
     { key: 'hasResources', label: '片源', all: '全部片源', options: [{ value: 'yes', label: '有片源' }, { value: 'no', label: '无片源' }] },
     { key: 'sourceId', label: '来源', all: '全部来源', options: sources.map(source => ({ value: source.id, label: source.name })) },
   ] as const;
-  const stats = [
-    { label: '已归档影片', value: dashboard?.movieCount, unit: '部', icon: Film, color: 'purple', note: '本地保存的影片资料' },
-    { label: '播放资源', value: dashboard?.resourceCount, unit: '条', icon: Layers3, color: 'blue', note: `播放时检测记录：${dashboard?.healthyResources ?? 0} 条通过` },
-    { label: '采集源', value: dashboard?.sourceCount, unit: '个', icon: Globe2, color: 'green', note: `${dashboard?.enabledSourceCount ?? 0} 个源已启用` },
-    { label: '平均下载速度', value: dashboard?.averageSpeedMbps != null ? dashboard.averageSpeedMbps.toFixed(1) : '—', unit: 'Mbps', icon: Wifi, color: 'orange', note: '基于播放时的视频分片检测记录' },
-  ];
   const filtered = !!(search || Object.values(filters).some(Boolean));
   const activeFilterCount = Object.values(filters).filter(Boolean).length + (search.trim() ? 1 : 0);
   const currentPage = list?.page ?? page; const totalPages = Math.max(1, Math.ceil((list?.total ?? 0) / 12));
   return <>
-    <section className="library-intro"><div><div className="eyebrow"><span /> PRIVATE FILM COLLECTION</div><h1>每一部好片，<span>都有归处。</span></h1><p>汇集电影、剧集、动漫与短剧，让你的私人片库持续生长。</p></div><button className="button primary" onClick={onSource}><Plus size={17} />添加采集源</button></section>
-    <section className="stats-grid" aria-label="资料库统计">{stats.map(item => <div className="stat-card" key={item.label}><div className="stat-top"><span>{item.label}</span><span className={`stat-icon ${item.color}`}><item.icon size={17} /></span></div><div className="stat-value">{item.value ?? '—'}<small>{item.unit}</small></div><div className="stat-note">{item.note}</div></div>)}</section>
     <section className="catalogue library-catalogue" aria-busy={loading}>
-      <div className="section-heading library-heading"><div><h2>我的影视库 <span>{list?.total ?? 0}</span></h2><p>按类型找故事，按条件挑好片。</p></div><span className="archive-label"><span className="status-dot online" />本地归档</span></div>
-      <nav className="library-type-tabs" aria-label="影片分类">{['', ...types].map(value => <button type="button" key={value} className={filters.type === value ? 'selected' : ''} aria-pressed={filters.type === value} onClick={() => changeFilter('type', value)}>{value || '全部'}</button>)}</nav>
+      <div className="page-heading library-heading"><div><div className="eyebrow">PRIVATE FILM COLLECTION</div><h1>{title} <span>{list?.total ?? 0}</span></h1><p>{category ? `浏览已归档的${category}，按条件挑选想看的内容。` : '浏览全部影片，或从左侧选择分类。'}</p></div><span className="archive-label"><span className="status-dot online" />本地归档</span></div>
       <div className="library-filters">
         <div className="library-search-row"><div className="search-field"><Search size={17} /><input aria-label="搜索影片名称、导演或演员" value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索片名、导演、演员…" />{search && <IconButton label="清除搜索" onClick={() => { setSearch(''); setDebouncedSearch(''); setPage(1); }}><X size={15} /></IconButton>}</div><span className="library-page-size">每页 12 部</span></div>
         <div className="library-filter-grid">{filterFields.map(field => <label className="library-filter" key={field.key}><span>{field.label}</span><div className="filter-select"><select aria-label={`影片${field.label}`} value={filters[field.key]} onChange={e => changeFilter(field.key, e.target.value)}><option value="">{field.all}</option>{filters[field.key] && !field.options.some(option => option.value === filters[field.key]) && <option value={filters[field.key]}>{field.key === 'sourceId' ? '已移除的来源' : filters[field.key]}</option>}{field.options.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}</select><ChevronDown size={13} /></div></label>)}</div>
         <div className="library-filter-summary"><span>{loading ? <><Spinner />正在更新…</> : <>共找到 <strong>{list?.total ?? 0}</strong> 部影片</>}{activeFilterCount > 0 && <small> · 已选 {activeFilterCount} 项条件</small>}</span>{filtered && <button type="button" className="text-button" onClick={clearFilters}><X size={12} />清除筛选</button>}</div>
       </div>
-      {error ? <div className="inline-error" role="alert"><CircleAlert size={18} />{error}</div> : loading && !list?.items.length ? <div className="loading-state"><Spinner />正在读取影视库…</div> : !list?.items.length ? <div className="library-empty"><div className="empty-art" aria-hidden="true"><div className="empty-poster p-left"><Film size={31} /></div><div className="empty-poster p-center"><Clapperboard size={40} /><span>CLOUDMEDIA</span></div><div className="empty-poster p-right"><Play size={29} /></div><span className="art-spark spark-one" /><span className="art-spark spark-two" /></div><h3>{filtered ? '暂时没有符合条件的影片' : '你的私人影院，从一个源开始'}</h3><p>{filtered ? '调整筛选条件，或清除筛选重新浏览全部影片。' : '添加采集源并运行一次采集，影片资料与播放资源就会出现在这里。'}</p>{filtered ? <button className="button secondary" onClick={clearFilters}>清除筛选</button> : <button className="button secondary" onClick={onNavigateSources}>管理采集源 <ArrowRight size={16} /></button>}<div className="empty-hint"><ShieldCheck size={13} />影片资料保存在本地，源站变更后仍可查看</div></div> : <>
+      {error ? <div className="inline-error" role="alert"><CircleAlert size={18} />{error}</div> : loading && !list?.items.length ? <div className="loading-state"><Spinner />正在读取影视库…</div> : !list?.items.length ? <div className="library-empty"><div className="empty-art" aria-hidden="true"><div className="empty-poster p-left"><Film size={31} /></div><div className="empty-poster p-center"><Clapperboard size={40} /><span>CLOUDMEDIA</span></div><div className="empty-poster p-right"><Play size={29} /></div><span className="art-spark spark-one" /><span className="art-spark spark-two" /></div><h3>{filtered ? '暂时没有符合条件的影片' : category ? `暂无已归档的${category}` : '你的私人影院，从一个源开始'}</h3><p>{filtered ? `调整筛选条件，或清除筛选重新浏览${category ? '当前分类' : '全部影片'}。` : category ? '可从左侧浏览其他分类，或采集更多内容。' : '添加采集源并运行一次采集，影片资料与播放资源就会出现在这里。'}</p>{filtered ? <button className="button secondary" onClick={clearFilters}>清除筛选</button> : <button className="button secondary" onClick={onNavigateSources}>管理采集源 <ArrowRight size={16} /></button>}<div className="empty-hint"><ShieldCheck size={13} />影片资料保存在本地，源站变更后仍可查看</div></div> : <>
         <div className={`movie-grid library-movie-grid ${loading ? 'refreshing' : ''}`}>{list.items.map(movie => <button type="button" className="movie-card library-movie-card" key={movie.id} onClick={() => onMovie(movie.id)} title={movie.title}>
           <div className="poster">{localPosterPath(movie.poster) ? <img key={movie.poster} src={localPosterPath(movie.poster)} alt="" loading="lazy" referrerPolicy="no-referrer" onError={e => { e.currentTarget.style.display = 'none'; }} /> : null}<div className="poster-fallback"><Film size={35} /><span>{movie.title}</span></div><span className="poster-type">{movie.libraryType || '影片'}</span>{hasRating(movie.rating) && <span className="rating">★ {movie.rating}</span>}<div className="poster-hover"><span><Play size={22} fill="currentColor" /></span></div></div>
           <div className="movie-card-title">{movie.title}</div><div className="library-movie-meta">{[movie.year, movie.region].filter(Boolean).join(' · ') || '年份 / 地区未标明'}</div><div className="library-movie-bottom"><span className={`library-update-status ${movie.updateStatus}`}>{statusLabels[movie.updateStatus]}</span><span className={movie.resourceCount ? '' : 'no-resources'}>{movie.resourceCount ? `${movie.resourceCount} 条片源` : '暂无片源'}</span></div>
         </button>)}</div>
         <div className="pagination library-pagination"><span>共 {list.total} 部 · 每页 12 部</span><div><IconButton label="上一页" disabled={loading || currentPage <= 1} onClick={() => setPage(currentPage - 1)}><ChevronLeft size={17} /></IconButton><span aria-live="polite">{currentPage} / {totalPages}</span><IconButton label="下一页" disabled={loading || currentPage >= totalPages} onClick={() => setPage(currentPage + 1)}><ChevronRight size={17} /></IconButton></div></div>
       </>}
-    </section><div className="library-bottom-note"><span><Clock3 size={14} />下次定时采集：{dashboard?.schedulerNextAt ? date(dashboard.schedulerNextAt) : '未安排'}</span><button onClick={() => onNavigateSources()}>查看采集配置 <ArrowRight size={13} /></button></div>
+    </section>
   </>;
 }
 
