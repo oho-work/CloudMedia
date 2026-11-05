@@ -11,6 +11,7 @@ test('PostgreSQL startup clears interrupted live activity while preserving compl
   const progress: RunProgress = {
     discoveredMovies: 12, completedMovies: 4, activeMovies: 3, concurrency: 3,
     currentPage: 2, paginationComplete: false, activeMovieTitles: ['正在处理甲', '正在处理乙'],
+    activeMovieProgress: [{ id: '3', title: '正在处理甲', stage: 'resources', completedPages: 2, totalPages: 8, cachedPages: 1, failedPages: 0, resourceCount: 2 }],
     probes: { queued: 8, active: 2, passed: 16, failed: 3 },
     failures: { collection: 2, probe: 3, poster: 1, runtime: 0, total: 6 },
   };
@@ -22,11 +23,15 @@ test('PostgreSQL startup clears interrupted live activity while preserving compl
   };
   const endedProgress = structuredClone(progress);
   endedProgress.activeMovies = 0; endedProgress.activeMovieTitles = [];
+  endedProgress.activeMovieProgress = [];
   endedProgress.probes.queued = endedProgress.probes.active = 0;
+  const legacyProgress = structuredClone(progress);
+  delete legacyProgress.activeMovieProgress;
   state.runs = [base,
     { ...structuredClone(base), id: 'queued', status: 'queued' },
     { ...structuredClone(base), id: 'ended', status: 'error', finishedAt: timestamp, progress: endedProgress },
     { ...structuredClone(base), id: 'legacy', progress: undefined },
+    { ...structuredClone(base), id: 'legacy-progress', progress: legacyProgress },
   ];
   const before = structuredClone(state);
   const upserts: { table: string; id: string; data: Record<string, any> }[] = [];
@@ -62,7 +67,7 @@ test('PostgreSQL startup clears interrupted live activity while preserving compl
     assert.equal(recovered.status, 'interrupted');
     assert.ok(Number.isFinite(Date.parse(recovered.finishedAt!)));
     assert.match(recovered.message, /服务重启/);
-    assert.deepEqual(recovered.progress, { ...progress, activeMovies: 0, activeMovieTitles: [], probes: { ...progress.probes, active: 0, queued: 0 } });
+    assert.deepEqual(recovered.progress, { ...progress, activeMovies: 0, activeMovieTitles: [], activeMovieProgress: [], probes: { ...progress.probes, active: 0, queued: 0 } });
     assert.equal(recovered.scanned, 12); assert.equal(recovered.added, 7); assert.equal(recovered.updated, 5); assert.equal(recovered.resourceCount, 49);
     assert.deepEqual(recovered.errors, base.errors);
     assert.deepEqual(upserts.find(row => row.table === 'runs' && row.id === id)?.data.progress, recovered.progress, 'reset activity must be committed at startup');
@@ -71,6 +76,7 @@ test('PostgreSQL startup clears interrupted live activity while preserving compl
   const legacy = store.state.runs.find(run => run.id === 'legacy')!;
   assert.equal(legacy.status, 'interrupted'); assert.equal(legacy.progress, undefined);
   assert.equal(Object.hasOwn(upserts.find(row => row.id === 'legacy')!.data, 'progress'), false, 'legacy runs must not acquire invented progress');
+  assert.equal(Object.hasOwn(upserts.find(row => row.id === 'legacy-progress')!.data.progress, 'activeMovieProgress'), false, 'old progress records must not acquire an invented active movie array');
   assert.deepEqual(store.state.movies, before.movies); assert.deepEqual(store.state.resources, before.resources);
   upserts.length = 0;
   await store.save();

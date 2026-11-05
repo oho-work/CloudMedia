@@ -47,10 +47,16 @@ export interface Movie {
   sourceRefs: { sourceId: string; externalId: string; pageUrl: string; updatedOn?: string }[];
   createdAt: string; updatedAt: string;
 }
+export interface ActiveMovieProgress {
+  id: string; title: string; stage: 'detail' | 'resources' | 'saving';
+  completedPages: number; totalPages: number | null;
+  cachedPages: number; failedPages: number; resourceCount: number;
+}
 export interface CollectionProgress {
   discoveredMovies: number; completedMovies: number; activeMovies: number;
   concurrency: number; currentPage: number; paginationComplete: boolean;
   activeMovieTitles: string[];
+  activeMovieProgress?: ActiveMovieProgress[];
 }
 export interface RunProgress extends CollectionProgress {
   /** Live queue/permit counts and actual measurement outcomes for this run only. */

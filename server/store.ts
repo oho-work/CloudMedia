@@ -84,6 +84,7 @@ export class Store {
       run.status = 'interrupted'; run.finishedAt = new Date().toISOString(); run.message = '服务重启，任务已中断，可重新采集';
       if (run.progress) {
         run.progress.activeMovies = 0; run.progress.activeMovieTitles = [];
+        if (run.progress.activeMovieProgress !== undefined) run.progress.activeMovieProgress = [];
         run.progress.probes.active = 0; run.progress.probes.queued = 0;
       }
     }

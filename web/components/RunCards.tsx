@@ -1,8 +1,8 @@
 import { useEffect, useId, useState } from 'react';
 import { Activity, Check, CheckCheck, ChevronDown, CircleAlert, Clock3, Film, Globe2, Layers3, LoaderCircle, Search, Trash2, Wifi, X } from 'lucide-react';
-import type { Run } from '../../shared/types';
+import type { ActiveMovieProgress, Run } from '../../shared/types';
 import { BEIJING_TIMEZONE } from '../../shared/schedule-settings';
-import { discoveredProgress, errorCategory, formatRunDuration, hasRunIssues, isRunActive, runFailureCount } from './run-display';
+import { concurrencySlots, discoveredProgress, errorCategory, formatRunDuration, hasRunIssues, isRunActive, moviePageProgress, runFailureCount } from './run-display';
 import './RunCards.css';
 
 const number = (value: number) => value.toLocaleString('zh-CN');
@@ -53,23 +53,49 @@ export function RunCard({ run, now, expanded, canceling, deleting, onExpand, onC
   const categories = [...new Set(run.errors.map(errorCategory))];
   const samples = run.errors.filter(message => (category === '全部' || errorCategory(message) === category) && message.toLowerCase().includes(search.toLowerCase()));
   const statusClass = run.status === 'error' ? 'error' : run.status === 'success' ? 'success' : active ? 'active' : 'muted';
-  const activity = progress ? active ? progress.activeMovies : 0 : null;
+  const slots = progress ? concurrencySlots(active ? progress.activeMovies : 0, progress.concurrency) : null;
   return <article className={`activity-card ${active ? 'is-active' : ''}`} aria-label={`${run.sourceName}，${statusNames[run.status]}`}>
     <header className="activity-card-head"><div className="activity-source-icon"><Globe2 size={21} /></div><div className="activity-title"><div><h2>{run.sourceName}</h2><span className={`activity-status ${statusClass}`}>{run.status === 'running' ? <LoaderCircle size={13} className="spin" /> : run.status === 'success' ? <Check size={13} /> : run.status === 'error' ? <CircleAlert size={13} /> : <Clock3 size={13} />}{statusNames[run.status]}{run.status === 'success' && issues ? ' · 有异常' : ''}</span></div><p><span>{date(run.startedAt)}</span><span className="activity-separator">·</span><span>{run.status === 'queued' ? '已等待' : active ? '已运行' : '耗时'} {formatRunDuration(run, now)}</span></p></div><span className="activity-scope">{run.dateRange ? run.dateRange.startDate === run.dateRange.endDate ? `更新日期 ${run.dateRange.startDate}` : `${run.dateRange.startDate} 至 ${run.dateRange.endDate}` : '全部日期'}</span></header>
     <div className="activity-metrics">
       <div className="activity-metric"><span><Film size={14} />影片处理</span><strong>{progress ? number(progress.completedMovies) : number(run.scanned)}<small>{progress ? ` / ${number(progress.discoveredMovies)} 部` : ' 部已入库'}</small></strong><p>新增 <b>{number(run.added)}</b> · 更新 <b>{number(run.updated)}</b></p></div>
-      <div className="activity-metric"><span><Activity size={14} />{active ? '当前影片并发' : '影片并发'}</span><strong>{activity === null ? '—' : activity}<small>{progress ? ` / ${progress.concurrency} 个槽位` : ' 暂无详细数据'}</small></strong>{progress ? <div className="activity-slots" aria-label={`${activity} 个使用中，上限 ${progress.concurrency}`}>{Array.from({ length: progress.concurrency }, (_, i) => <i key={i} className={i < (activity ?? 0) ? 'used' : ''} />)}</div> : <p>此记录未记录实时并发</p>}</div>
+      <div className="activity-metric"><span><Activity size={14} />{active ? '当前影片并发' : '影片并发'}</span><strong>{slots ? slots.active : '—'}<small>{slots ? ` / ${slots.total} 个槽位` : ' 暂无详细数据'}</small></strong>{slots ? <div className="activity-slots" role="img" aria-label={`${slots.active} 个使用中，上限 ${slots.total}`} title={slots.dots ? `每点代表 ${number(slots.total / slots.dots)} 个槽位，按占用比例向下取整点亮` : '当前没有可用槽位'}>{Array.from({ length: slots.dots }, (_, i) => <i key={i} aria-hidden="true" className={i < slots.lit ? 'used' : ''} />)}</div> : <p>此记录未记录实时并发</p>}</div>
       <div className="activity-metric"><span><Layers3 size={14} />播放资源</span><strong>{number(run.resourceCount)}<small>条已入库</small></strong><p>采集仅保存资料与片源</p></div>
       <div className={`activity-metric ${issues ? 'has-issues' : ''}`}><span><CircleAlert size={14} />异常情况</span><strong>{failures === null ? (run.errors.length ? `${run.errors.length}` : '—') : number(failures)}<small>{failures === null ? run.errors.length ? '条异常样本' : ' 未记录计数' : '次异常'}</small></strong><p>{progress ? `检测失败 ${number(progress.failures.probe)} · 采集异常 ${number(progress.failures.collection)}` : run.errors.length ? '展开详情查看原因' : '此记录没有异常样本'}</p></div>
     </div>
-    <div className="activity-progress"><div><span>{progress ? '已发现影片的处理进度' : '运行状态'}</span><span>{progress ? <>{number(progress.completedMovies)} / {number(progress.discoveredMovies)} 部{active && !progress.paginationComplete ? ' · 仍在发现影片' : ''}</> : '历史记录未采集详细进度'}</span></div><div className={`activity-progress-track ${active && percent === null ? 'is-discovering' : ''}`} role="progressbar" aria-label="已发现影片的处理进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent ?? undefined} aria-valuetext={progress ? `已完成 ${progress.completedMovies} 部，已发现 ${progress.discoveredMovies} 部。${progress.paginationComplete ? '分页已结束' : active ? '仍可能发现更多影片' : '分页已停止'}` : '无详细进度数据'}><i style={{ width: percent !== null ? `${percent}%` : '0%' }} /></div></div>
+    <div className="activity-progress"><div><span>{progress ? '已发现影片的处理进度' : '运行状态'}</span><span>{progress ? <>{number(progress.completedMovies)} / {number(progress.discoveredMovies)} 部{percent !== null ? ` · ${Math.floor(percent)}%` : active && !progress.paginationComplete ? ' · 仍在发现影片' : ''}</> : '历史记录未采集详细进度'}</span></div><div className={`activity-progress-track ${active && percent === null ? 'is-discovering' : ''}`} role="progressbar" aria-label="已发现影片的处理进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent ?? undefined} aria-valuetext={progress ? `已完成 ${progress.completedMovies} 部，已发现 ${progress.discoveredMovies} 部。${progress.paginationComplete ? '分页已结束' : active ? '仍可能发现更多影片' : '分页已停止'}` : '无详细进度数据'}><i style={{ width: percent !== null ? `${percent}%` : '0%' }} /></div></div>
     <footer className="activity-card-footer"><p><span className={`status-dot ${active ? 'online' : ''}`} />{run.message || (run.status === 'queued' ? '等待前序任务完成' : '暂无运行消息')}</p><div className="activity-actions"><button type="button" className="activity-detail-toggle" aria-expanded={expanded} aria-controls={detailId} onClick={onExpand}>{expanded ? '收起详情' : '任务详情'}<ChevronDown size={15} className={expanded ? 'rotated' : ''} /></button>{active ? <button type="button" className="activity-secondary-action" onClick={onCancel} disabled={canceling} title="停止任务，保留已保存的采集结果">{canceling ? <LoaderCircle size={14} className="spin" /> : <X size={14} />}{canceling ? '取消中…' : '取消任务'}</button> : <button type="button" className="activity-secondary-action" onClick={onDelete} disabled={deleting} aria-label={`删除${run.sourceName}的任务记录`}>{deleting ? <LoaderCircle size={14} className="spin" /> : <Trash2 size={14} />}{deleting ? '删除中…' : '删除记录'}</button>}</div></footer>
     {expanded && <div id={detailId} className="activity-expanded">
-      <div className="activity-detail-grid"><section><h3><Activity size={15} />影片流水线</h3><dl className="activity-facts"><div><dt>列表分页</dt><dd>{progress ? `第 ${Math.max(1, progress.currentPage)} 页${progress.paginationComplete ? ' · 已结束' : active ? ' · 持续发现' : ' · 已停止'}` : '未记录'}</dd></div><div><dt>发现 / 完成</dt><dd>{progress ? `${progress.discoveredMovies} / ${progress.completedMovies} 部` : '未记录'}</dd></div><div><dt>结束时间</dt><dd>{run.finishedAt ? date(run.finishedAt) : '尚未结束'}</dd></div></dl><p className="activity-detail-hint">每个影片槽涵盖资料、片源解析与海报归档，释放后自动补位。</p>{active && progress && <div className="activity-movie-titles"><span>正在处理的影片</span>{progress.activeMovieTitles.length ? <div>{progress.activeMovieTitles.map((title, index) => <span key={`${title}-${index}`}>{title}</span>)}</div> : <p>{progress.activeMovies > 0 ? '正在读取影片详情…' : '当前没有活动影片槽'}</p>}</div>}</section>
+      <div className="activity-detail-grid"><section><h3><Activity size={15} />影片流水线</h3><dl className="activity-facts"><div><dt>列表分页</dt><dd>{progress ? `第 ${Math.max(1, progress.currentPage)} 页${progress.paginationComplete ? ' · 已结束' : active ? ' · 持续发现' : ' · 已停止'}` : '未记录'}</dd></div><div><dt>发现 / 完成</dt><dd>{progress ? `${progress.discoveredMovies} / ${progress.completedMovies} 部` : '未记录'}</dd></div><div><dt>结束时间</dt><dd>{run.finishedAt ? date(run.finishedAt) : '尚未结束'}</dd></div></dl><p className="activity-detail-hint">每个影片槽涵盖资料、片源解析与海报归档，释放后自动补位。</p>{active && progress && <ActiveMovies progress={progress} />}</section>
       <section><h3><Wifi size={15} />播放时检测</h3><p className="activity-detail-hint">采集阶段不检测速度与分辨率。播放某集时，自动检测该集全部线路，结果显示在影片详情的线路对比中。</p>{progress && (progress.probes.passed > 0 || progress.probes.failed > 0) && <p className="activity-detail-hint">历史任务检测：通过 {number(progress.probes.passed)} · 未通过 {number(progress.probes.failed)}</p>}</section></div>
       <section className="activity-failures"><div className="activity-failure-heading"><div><h3><CircleAlert size={15} />异常与失败</h3><p>{failures !== null ? `累计 ${number(failures)} 次异常 · 保留 ${run.errors.length} 条样本。同一影片可能发生多次异常。` : `保留 ${run.errors.length} 条异常样本，历史记录没有完整失败计数。`}</p></div>{progress && <div className="activity-failure-counts"><span>采集 <b>{progress.failures.collection}</b></span><span>检测 <b>{progress.failures.probe}</b></span><span>海报 <b>{progress.failures.poster}</b></span><span>任务 <b>{progress.failures.runtime}</b></span></div>}</div>
       {run.errors.length ? <><div className="activity-error-tools"><div className="activity-error-filters" role="group" aria-label="筛选异常样本">{['全部', ...categories].map(item => <button key={item} type="button" aria-pressed={category === item} className={category === item ? 'selected' : ''} onClick={() => setCategory(item)}>{item}</button>)}</div><label className="activity-error-search"><Search size={14} /><input aria-label="搜索异常样本" value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索影片或错误…" /></label></div><ul className="activity-error-samples" aria-label="异常样本">{samples.map((message, index) => <li key={index}><span>{errorCategory(message)}</span><p>{message}</p></li>)}{!samples.length && <li className="activity-no-errors">没有符合条件的异常样本</li>}</ul></> : <p className="activity-no-errors"><Check size={15} />{failures ? '本次异常未保留文本样本。' : '尚未记录到异常。'}</p>}
       </section><p className="activity-run-id">任务 ID · {run.id}</p>
     </div>}
   </article>;
+}
+
+function ActiveMovies({ progress }: { progress: NonNullable<Run['progress']> }) {
+  const movies = progress.activeMovieProgress;
+  let content = <p>{progress.activeMovies > 0 ? '正在读取影片详情…' : '当前没有活动影片槽'}</p>;
+  if (movies?.length) {
+    content = <>
+      <p className="activity-movie-note">播放页进度含缓存与失败页；页数处理完毕后仍需保存与海报归档。</p>
+      <ul className="activity-movie-progress-list" aria-label="正在处理的影片" tabIndex={0}>
+        {movies.map(movie => <MovieProgressRow key={movie.id} movie={movie} />)}
+      </ul>
+    </>;
+  } else if (movies === undefined && progress.activeMovieTitles.length) {
+    content = <div>{progress.activeMovieTitles.map((title, index) => <span key={`${title}-${index}`}>{title}</span>)}</div>;
+  }
+  return <div className="activity-movie-titles"><span>正在处理的影片</span>{content}</div>;
+}
+
+function MovieProgressRow({ movie }: { movie: ActiveMovieProgress }) {
+  const percent = moviePageProgress(movie);
+  return <li>
+    <strong>{movie.title}</strong>
+    <p className="activity-movie-stage">{movie.stage === 'detail' ? '正在读取影片详情…' : movie.stage === 'saving' ? '正在保存与海报归档…' : <>播放页已处理 <b>{number(movie.completedPages)}{movie.totalPages !== null && movie.totalPages > 0 ? ` / ${number(movie.totalPages)}` : ' · 总数待确认'}</b>{percent !== null && <span>{percent}%</span>}</>}</p>
+    {percent !== null && <div className="activity-movie-progress-track" role="progressbar" aria-label={`${movie.title}的播放页处理进度`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent} aria-valuetext={`已处理 ${movie.completedPages} / ${movie.totalPages} 页，含缓存 ${movie.cachedPages} 页、失败 ${movie.failedPages} 页；影片仍在处理中`}><i style={{ width: `${percent}%` }} /></div>}
+    <p className="activity-movie-counts"><span>缓存 <b>{number(movie.cachedPages)}</b></span><span className={movie.failedPages ? 'has-failures' : ''}>失败 <b>{number(movie.failedPages)}</b></span><span>已获取资源 <b>{number(movie.resourceCount)}</b> 条</span></p>
+  </li>;
 }

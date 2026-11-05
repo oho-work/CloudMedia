@@ -1,4 +1,4 @@
-import type { Run } from '../../shared/types';
+import type { ActiveMovieProgress, Run } from '../../shared/types';
 
 export const isRunActive = (run: Run) => run.status === 'running' || run.status === 'queued';
 export const hasRunIssues = (run: Run) => run.status === 'error' || (run.progress?.failures.total ?? run.errors.length) > 0;
@@ -6,8 +6,22 @@ export const runFailureCount = (run: Run): number | null => run.progress?.failur
 
 export function discoveredProgress(run: Run): number | null {
   const progress = run.progress;
-  if (!progress || progress.discoveredMovies <= 0 || (isRunActive(run) && !progress.paginationComplete)) return null;
-  return Math.min(100, Math.max(0, progress.completedMovies / progress.discoveredMovies * 100));
+  if (!progress || progress.discoveredMovies <= 0 || !progress.paginationComplete) return null;
+  return Math.min(100, Math.max(0, progress.completedMovies * 100 / progress.discoveredMovies));
+}
+
+export function concurrencySlots(activeMovies: number, concurrency: number) {
+  const total = Number.isFinite(concurrency) ? Math.max(0, Math.floor(concurrency)) : 0;
+  const active = Number.isFinite(activeMovies) ? Math.min(total, Math.max(0, Math.floor(activeMovies))) : 0;
+  const dots = Math.min(20, total);
+  // A partial proportional dot stays dark so occupancy is never exaggerated.
+  const lit = total ? Math.floor(active / total * dots) : 0;
+  return { active, total, dots, lit };
+}
+
+export function moviePageProgress(movie: ActiveMovieProgress): number | null {
+  if (movie.stage !== 'resources' || movie.totalPages === null || movie.totalPages <= 0) return null;
+  return Math.min(100, Math.max(0, Math.floor(movie.completedPages * 100 / movie.totalPages)));
 }
 
 export function errorCategory(message: string): string {

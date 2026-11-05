@@ -1,6 +1,6 @@
 import { load } from 'cheerio';
 import { setTimeout as delay } from 'node:timers/promises';
-import type { CollectedMovie, CollectedResource, CollectionContext, Source } from '../shared/types.js';
+import type { ActiveMovieProgress, CollectedMovie, CollectedResource, CollectionContext, Source } from '../shared/types.js';
 import { readTextLimited, safeFetch, safeUrlLabel } from './upstream.js';
 import { resolveDateRange, sourceDate } from './dates.js';
 import { concurrentBatch, TaskLimiter } from './concurrency.js';
@@ -222,6 +222,15 @@ export function orderPlaybackPages<T extends { url: string; episode: string }>(p
 }
 
 
+/** Match the logical line/episode identity persisted by upsertMovie. */
+function countMovieResources(resources: Iterable<CollectedResource>, sourceName: string): number {
+  const identities = new Set<string>();
+  for (const resource of resources) identities.add(JSON.stringify([
+    resource.name.trim() || sourceName.trim(), resource.episode.trim() || '正片',
+  ]));
+  return identities.size;
+}
+
 interface HtmlPlan {
   movie: CollectedMovie;
   resources: Map<string, CollectedResource>;
@@ -254,7 +263,8 @@ function htmlPlan(movie: CollectedMovie, detail: { body: string; url: string }, 
   return { movie, resources, playPages };
 }
 
-async function populateHtmlResources(plan: HtmlPlan, client: SourceClient, context: CollectionContext): Promise<CollectedMovie> {
+async function populateHtmlResources(plan: HtmlPlan, client: SourceClient, context: CollectionContext, sourceName: string,
+  onProgress: (progress: Pick<ActiveMovieProgress, 'stage' | 'completedPages' | 'totalPages' | 'cachedPages' | 'failedPages' | 'resourceCount'>) => void): Promise<CollectedMovie> {
   const { movie, resources, playPages } = plan;
   const freshByPage = new Map<string, CollectedResource[]>();
   for (const resource of context.existingResources?.(movie.externalId) ?? []) {
@@ -264,14 +274,19 @@ async function populateHtmlResources(plan: HtmlPlan, client: SourceClient, conte
   }
   const knownPages = new Set(context.knownPageUrls?.(movie.externalId) ?? freshByPage.keys());
   const pending: { url: string; episode: string; name: string }[] = [];
+  let cachedPages = 0;
   for (const play of playPages.values()) {
     const cached = freshByPage.get(play.url);
-    if (cached?.length) for (const resource of cached) resources.set(`${resource.url}|${resource.episode}|${resource.name}`, resource);
+    if (cached?.length) {
+      cachedPages++;
+      for (const resource of cached) resources.set(`${resource.url}|${resource.episode}|${resource.name}`, resource);
+    }
     else pending.push(play);
   }
   // New episodes win over old pages whose cached URLs need periodic refresh.
   const orderedPending = orderPlaybackPages(pending, knownPages);
   const resolvedPages = new Map<number, CollectedResource[]>();
+  let completedPages = cachedPages; let failedPages = 0;
   let lastCheckpoint = '';
   const snapshotResources = () => {
     const current = new Map(resources);
@@ -281,6 +296,8 @@ async function populateHtmlResources(plan: HtmlPlan, client: SourceClient, conte
     }
     return [...current.values()];
   };
+  const reportProgress = () => onProgress({ stage: completedPages === playPages.size ? 'saving' : 'resources',
+    completedPages, totalPages: playPages.size, cachedPages, failedPages, resourceCount: countMovieResources(snapshotResources(), sourceName) });
   const checkpoint = async () => {
     if (!context.onCheckpoint) return;
     const snapshot = { ...movie, resources: snapshotResources() };
@@ -289,29 +306,35 @@ async function populateHtmlResources(plan: HtmlPlan, client: SourceClient, conte
     lastCheckpoint = identity;
     await context.onCheckpoint(structuredClone(snapshot));
   };
+  reportProgress();
   await checkpoint();
   try {
-    // A worker owns a movie slot through probing; one playback-page producer per
+    // A worker owns a movie slot through saving; one playback-page producer per
     // movie keeps a long series from filling the entire shared HTTP queue.
     await concurrentBatch(orderedPending, context.onMovie ? 1 : client.limit, async (play, index) => {
       try {
-        context.log(`正在采集「${movie.title}」${play.name} / ${play.episode}（${index + 1}/${orderedPending.length} 个播放页）`);
+        context.log(`正在采集「${movie.title}」${play.name} / ${play.episode}（已完成 ${completedPages}/${playPages.size} 个播放页）`);
         let content: { body: string; url: string } | undefined;
         try { content = await client.get(play.url, movie.pageUrl); }
         catch (error) { if (error instanceof StopError || context.signal?.aborted) throw error; }
+        context.signal?.throwIfAborted();
         if (content) {
           const urls = playbackResponseUrls(content);
           if (!urls.length) {
+            failedPages++;
             const message = `「${movie.title}」${play.name} / ${play.episode} 未发现公开 m3u8，保留影片资料及已有资源`;
             context.log(message); context.onCollectionError?.(message);
           }
           resolvedPages.set(index, urls.map(url => ({ name: play.name, episode: play.episode, url, referer: content!.url, pageUrl: content!.url, resolvedAt: new Date().toISOString() })));
         } else {
+          failedPages++;
           const message = `「${movie.title}」${play.episode} 播放页请求失败，保留影片资料及已有资源：${safeUrlLabel(play.url)}`;
           context.log(message); context.onCollectionError?.(message);
         }
-        // Publish this page as soon as it is resolved, before waiting for any
-        // sibling page or movie, so its measurements can start immediately.
+        completedPages++;
+        reportProgress();
+        // Persist each resolved page before waiting for sibling pages or movies,
+        // so already collected addresses survive an interrupted collection.
         await checkpoint();
       } catch (error) {
         client.stop(error);
@@ -373,6 +396,7 @@ async function* collectSourcePages(source: Source, context: CollectionContext, a
   let count = 0;
   let completedMovies = 0; let currentPage = 0; let paginationComplete = false;
   const activeTitles = new Map<number, string>();
+  const activeMovieProgress = new Map<number, ActiveMovieProgress>();
   let reachedStart = false;
   const visited = new Set<string>();
   const visitedPages = new Set<string>();
@@ -380,7 +404,8 @@ async function* collectSourcePages(source: Source, context: CollectionContext, a
   const active = new Set<Promise<void>>();
   const reportProgress = () => context.onProgress?.({ discoveredMovies: count, completedMovies,
     activeMovies: active.size, concurrency: client.limit, currentPage, paginationComplete,
-    activeMovieTitles: [...activeTitles.values()].filter(Boolean).slice(0, client.limit).map(title => title.slice(0, 160)) });
+    activeMovieTitles: [...activeTitles.values()].filter(Boolean).slice(0, client.limit).map(title => title.slice(0, 160)),
+    activeMovieProgress: [...activeMovieProgress.values()].map(movie => ({ ...movie, title: movie.title.slice(0, 160) })) });
   const completed = new Map<number, CollectedMovie | null>();
   const ready: CollectedMovie[] = [];
   let scheduled = 0; let nextResult = 0; let finished = false;
@@ -403,6 +428,9 @@ async function* collectSourcePages(source: Source, context: CollectionContext, a
   };
   const schedule = (detailUrl: string, referer: string) => {
     const sequence = scheduled++;
+    const movieProgress: ActiveMovieProgress = { id: String(sequence), title: '读取影片资料…', stage: 'detail',
+      completedPages: 0, totalPages: null, cachedPages: 0, failedPages: 0, resourceCount: 0 };
+    activeMovieProgress.set(sequence, movieProgress);
     const previousDecision = decisions;
     let releaseDecision!: () => void;
     decisions = new Promise<void>(resolve => { releaseDecision = resolve; });
@@ -446,10 +474,11 @@ async function* collectSourcePages(source: Source, context: CollectionContext, a
         plan = htmlPlan(movie, detail, source);
         count++;
         activeTitles.set(sequence, movie.title);
+        Object.assign(movieProgress, { title: movie.title, stage: 'resources', totalPages: plan.playPages.size, resourceCount: countMovieResources(plan.resources.values(), source.name) });
         reportProgress();
         if (dateRange) context.log(`已发现 ${count} 部日期范围内影片，正在补齐播放资源`);
       } finally { releaseDecision(); }
-      const movie = await populateHtmlResources(plan, client, context);
+      const movie = await populateHtmlResources(plan, client, context, source.name, update => { Object.assign(movieProgress, update); reportProgress(); });
       await context.onMovie?.(movie);
       context.signal?.throwIfAborted();
       completedMovies++;
@@ -459,7 +488,7 @@ async function* collectSourcePages(source: Source, context: CollectionContext, a
       else completed.set(sequence, movie);
     }, error => {
       releaseDecision(); if (!context.onMovie) completed.set(sequence, null); stop(error);
-    }).finally(() => { active.delete(task); activeTitles.delete(sequence); reportProgress(); wake(); });
+    }).finally(() => { active.delete(task); activeTitles.delete(sequence); activeMovieProgress.delete(sequence); reportProgress(); wake(); });
     active.add(task);
     reportProgress();
   };

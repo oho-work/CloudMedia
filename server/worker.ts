@@ -39,12 +39,13 @@ function nextResourceTimestamp(resource: Resource): string {
 function initialProgress(concurrency: number): RunProgress {
   return { discoveredMovies: 0, completedMovies: 0, activeMovies: 0,
     concurrency: Math.max(1, Math.min(100, Math.floor(concurrency || 1))), currentPage: 0, paginationComplete: false,
-    activeMovieTitles: [], probes: { queued: 0, active: 0, passed: 0, failed: 0 },
+    activeMovieTitles: [], activeMovieProgress: [], probes: { queued: 0, active: 0, passed: 0, failed: 0 },
     failures: { collection: 0, probe: 0, poster: 0, runtime: 0, total: 0 } };
 }
 function finishProgress(run: Run) {
   if (!run.progress) return;
   run.progress.activeMovies = 0; run.progress.activeMovieTitles = [];
+  if (run.progress.activeMovieProgress !== undefined) run.progress.activeMovieProgress = [];
   run.progress.probes.queued = run.progress.probes.active = 0;
 }
 function recordFailure(run: Run, phase: Exclude<keyof RunProgress['failures'], 'total'>, message: string) {

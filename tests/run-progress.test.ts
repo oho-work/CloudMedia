@@ -57,6 +57,7 @@ test('run progress retains complete collection failure counts beyond the bounded
   assert.ok(run.errors.every(message => !message.includes('secret=') && !message.includes('http://')));
   assert.equal(run.progress?.discoveredMovies, 1); assert.equal(run.progress?.completedMovies, 1);
   assert.equal(run.progress?.paginationComplete, true); assert.equal(run.progress?.activeMovies, 0);
+  assert.deepEqual(run.progress?.activeMovieProgress, []);
   assert.deepEqual(run.progress?.probes, { queued: 0, active: 0, passed: 0, failed: 0 });
   assert.deepEqual(f.durable().runs[0].progress, run.progress);
 });
@@ -95,6 +96,7 @@ test('a coalesced progress write failure aborts active collection and saves zero
   assert.equal(run.progress?.paginationComplete, false);
   assert.equal(run.progress?.activeMovies, 0);
   assert.deepEqual(run.progress?.activeMovieTitles, []);
+  assert.deepEqual(run.progress?.activeMovieProgress, []);
   assert.deepEqual(run.progress?.probes, { queued: 0, active: 0, passed: 0, failed: 0 });
   const finished = JSON.stringify(run);
   await delay(300);
